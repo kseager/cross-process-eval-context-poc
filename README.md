@@ -36,6 +36,24 @@ more than one agent invocation it can't say *which* one an eval belongs to. This
 POC binds the eval to the **specific `invoke_agent` `span_id`**, so correlation
 is unambiguous and queryable via the first-class `operation_ParentId` column.
 
+## Requirements
+
+The design must satisfy all of the following. Each is a hard requirement, not a
+nice-to-have.
+
+1. **Span-level (not trace-level) correlation.** The ground-truth data must
+   attach to **exactly one** `invoke_agent` span, identified by its `span_id` —
+   *not* merely to the trace it belongs to.
+2. **Two independent processes.** The evaluator runs in a **separate process**
+   from the runner that owns the `invoke_agent` span (both alive concurrently).
+3. **No agent-process code changes.** The agent/target process must require
+   **zero** code changes. Only the runner and evaluator are ours to modify.
+4. **Attach a ground-truth object.** Carry a structured ground-truth object
+   (not a bare string), mirroring `trace-ground-truth-poc`'s
+   `evaluation.ground_truth` event.
+5. **Cheap, unambiguous backend query.** Correlation must be resolvable in App
+   Insights with a simple, first-class join (no fragile string/JSON parsing).
+
 ## How it works
 
 ```
@@ -49,7 +67,7 @@ is unambiguous and queryable via the first-class `operation_ParentId` column.
 ┌──────────────── eval-worker process (separate) ─────────────────────┐
 │  parent_ctx = parent_context_from_traceparent(tp)  # remote parent   │
 │  with tracer.start_as_current_span(                                  │
-│          "gen_ai.evaluation.results", context=parent_ctx) as s:      │
+│          "gen_ai.evaluation.input", context=parent_ctx) as s:      │
 │      s.add_event("evaluation.ground_truth", {ground_truth: {...}})   │
 │      # s.parentSpanId == the invoke_agent span_id  → span-exact      │
 └──────────────────────────────────────────────────────────────────────┘
@@ -60,7 +78,7 @@ Resulting span tree (one `trace_id`):
 ```
 invoke_agent                         (runner, span_id=A)
 ├─ chat / tool spans                 (agent framework, if instrumented)
-└─ gen_ai.evaluation.results         (eval-worker, parentSpanId=A)  ← span-exact
+└─ gen_ai.evaluation.input           (eval-worker, parentSpanId=A)  ← span-exact
       • event: evaluation.ground_truth { item_id, query, ground_truth }
 ```
 
@@ -122,15 +140,14 @@ its `gen_ai.evaluation.ground_truth` attribute (JSON):
 
 ```kql
 dependencies
-| where name == "gen_ai.evaluation.results"
+| where name == "gen_ai.evaluation.input"
 | join kind=inner (
     dependencies | where name == "invoke_agent"
 ) on $left.operation_ParentId == $right.id     // eval.parent == invoke_agent.spanId
 | project timestamp, operation_Id,
           invoke_agent_span = id1,
           eval_parent_span = operation_ParentId,
-          ground_truth = tostring(customDimensions["gen_ai.evaluation.ground_truth"]),
-          score = todouble(customDimensions["gen_ai.evaluation.score"])
+          ground_truth = tostring(customDimensions["gen_ai.evaluation.ground_truth"])
 ```
 
 `operation_ParentId` (parentSpanId) equals the exact `invoke_agent` `id`

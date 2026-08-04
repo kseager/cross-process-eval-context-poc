@@ -7,7 +7,7 @@ Exposes ``POST /evaluate``. The runner calls it once per dataset row, passing:
 * the data needed to evaluate (``query``, ``response``, ``ground_truth``).
 
 The worker rebuilds a remote parent context from that ``traceparent`` and starts
-a ``gen_ai.evaluation.results`` span **as a child of that specific
+a ``gen_ai.evaluation.input`` span **as a child of that specific
 invoke_agent span** (span-exact), in the same trace. It then attaches the full
 **ground-truth object** to that child span as an ``evaluation.ground_truth``
 event (mirroring the single-process ``trace-ground-truth-poc``), and exports it
@@ -38,7 +38,7 @@ logger = logging.getLogger("eval-worker")
 
 SERVICE_NAME = "eval-worker"
 
-EVAL_SPAN_NAME = "gen_ai.evaluation.results"
+EVAL_SPAN_NAME = "gen_ai.evaluation.input"
 GROUND_TRUTH_EVENT = "evaluation.ground_truth"
 
 app = FastAPI(title="span-exact-eval-worker")
@@ -104,7 +104,13 @@ def _startup() -> None:
 
 @app.post("/evaluate", response_model=EvaluateResponse)
 def evaluate(req: EvaluateRequest) -> EvaluateResponse:
-    """Score one row and emit a span-exact ``gen_ai.evaluation.results`` span."""
+    """Attach ground-truth input to a span-exact child of invoke_agent.
+
+    Creates a ``gen_ai.evaluation.input`` span parented to the exact
+    ``invoke_agent`` span (via the propagated traceparent) and attaches the
+    ground-truth object to it. A trivial score is included for demonstration,
+    but the span represents evaluation *input*, not results.
+    """
     assert _tracer is not None, "tracer not initialized"
 
     # Rebuild the remote parent from the propagated invoke_agent traceparent.

@@ -6,7 +6,7 @@ so their spans land in the same App Insights resource and can be joined by id.
 
 The ``service_name`` is surfaced as ``cloud_RoleName`` in App Insights, so the
 runner-created ``invoke_agent`` span and the evaluator-created
-``gen_ai.evaluation.results`` span are attributable to distinct roles while
+``gen_ai.evaluation.input`` span are attributable to distinct roles while
 sharing one trace.
 """
 

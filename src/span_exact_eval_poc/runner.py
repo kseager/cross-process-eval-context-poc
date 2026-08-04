@@ -8,7 +8,7 @@ For every dataset row this process:
 3. Builds a W3C ``traceparent`` that points at *this specific* ``invoke_agent``
    span and POSTs it -- with the query/response/ground_truth -- to the separate
    **eval-worker** process (``EVAL_WORKER_URL``).
-4. The eval-worker creates a ``gen_ai.evaluation.results`` span **as a child of
+4. The eval-worker creates a ``gen_ai.evaluation.input`` span **as a child of
    that exact invoke_agent span**, span-exact and cross-process.
 
 The evaluation therefore attaches to exactly one span, in another process,
@@ -121,7 +121,7 @@ def cli() -> None:
     args = parser.parse_args()
 
     asyncio.run(run(args.dataset, args.eval_worker_url))
-    print("\nDone. invoke_agent + gen_ai.evaluation.results exported to App Insights.")
+    print("\nDone. invoke_agent + gen_ai.evaluation.input exported to App Insights.")
 
 
 if __name__ == "__main__":
