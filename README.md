@@ -1,4 +1,4 @@
-# span-exact-eval-poc
+# span-two-process-eval-poc
 
 A proof-of-concept that attaches a **ground-truth object** to a span that is a
 **span-exact child** of a framework-generated **`invoke_agent` span** — **across
@@ -90,7 +90,7 @@ eval-worker over HTTP.
 
 ```
 data/dataset.jsonl                         # query + ground_truth rows
-src/span_exact_eval_poc/
+src/span_two_process_eval_poc/
   dataset.py                               # JSONL loader
   telemetry.py                             # Azure Monitor setup (both processes)
   trace_context.py                         # build/parse traceparent (the core)
@@ -119,7 +119,7 @@ uv sync
 Terminal 1 — the eval-worker:
 
 ```bash
-uv run uvicorn span_exact_eval_poc.eval_worker:app --port 8001
+uv run uvicorn span_two_process_eval_poc.eval_worker:app --port 8001
 ```
 
 Terminal 2 — the runner:
