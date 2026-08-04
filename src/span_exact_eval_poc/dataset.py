@@ -10,16 +10,20 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Iterator
 
 
 @dataclass(frozen=True)
 class DatasetItem:
-    """A single evaluation example."""
+    """A single evaluation example.
+
+    ``ground_truth`` is kept as the raw parsed value (a dict/object, string,
+    list, etc.) so the full ground-truth object can be attached to a span.
+    """
 
     id: str
     query: str
-    ground_truth: str
+    ground_truth: Any
 
 
 def load_dataset(path: str | Path) -> Iterator[DatasetItem]:
@@ -56,5 +60,5 @@ def load_dataset(path: str | Path) -> Iterator[DatasetItem]:
             yield DatasetItem(
                 id=str(record.get("id", line_number)),
                 query=str(record["query"]),
-                ground_truth=str(record["ground_truth"]),
+                ground_truth=record["ground_truth"],
             )

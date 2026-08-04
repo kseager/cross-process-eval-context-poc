@@ -1,15 +1,26 @@
 # span-exact-eval-poc
 
-A proof-of-concept that attaches an **evaluation result** to **exactly one**
-framework-generated **`invoke_agent` span** — **across two separate processes** —
-**without any code changes in the agent process**.
+A proof-of-concept that attaches a **ground-truth object** to a span that is a
+**span-exact child** of a framework-generated **`invoke_agent` span** — **across
+two separate processes** — **without any code changes in the agent process**.
 
-It is the span-exact, cross-process evolution of
-[`trace-ground-truth-poc`](https://github.com/singankit/trace-ground-truth-poc):
-where that POC stamped ground truth as an **event on its own in-process
-`invoke_agent` span**, this POC creates the evaluation as a **child span of a
-specific `invoke_agent` span living in another process**, correlated by the W3C
-`traceparent` (`trace_id` + `span_id`).
+It combines three ideas:
+
+- **[`trace-ground-truth-poc`](https://github.com/singankit/trace-ground-truth-poc)**
+  (Ankit): attach the ground-truth object as an `evaluation.ground_truth`
+  **event**. That POC does it on its *own in-process* `invoke_agent` span.
+- **Two-process reality**: a separate evaluator process **cannot** mutate the
+  runner's already-created `invoke_agent` span (spans are immutable once ended,
+  and you can't hold another process's live span). So instead the evaluator
+  creates a **child span** of that exact `invoke_agent` span and puts the
+  ground-truth event on the *child*.
+- **Trace-context propagation** (Yingying's eval-results-traces design): the
+  runner carries the specific `invoke_agent` span's identity to the evaluator as
+  a W3C `traceparent`, so the child-attach is seamless and **span-exact**.
+
+Net result: the ground-truth object lands on a span whose `parentSpanId` is
+**exactly** the `invoke_agent` span — queryable in App Insights via the
+first-class `operation_ParentId` column.
 
 ## Why this design
 
@@ -39,7 +50,7 @@ is unambiguous and queryable via the first-class `operation_ParentId` column.
 │  parent_ctx = parent_context_from_traceparent(tp)  # remote parent   │
 │  with tracer.start_as_current_span(                                  │
 │          "gen_ai.evaluation.results", context=parent_ctx) as s:      │
-│      s.set_attribute("gen_ai.evaluation.score", score)              │
+│      s.add_event("evaluation.ground_truth", {ground_truth: {...}})   │
 │      # s.parentSpanId == the invoke_agent span_id  → span-exact      │
 └──────────────────────────────────────────────────────────────────────┘
 ```
@@ -50,6 +61,7 @@ Resulting span tree (one `trace_id`):
 invoke_agent                         (runner, span_id=A)
 ├─ chat / tool spans                 (agent framework, if instrumented)
 └─ gen_ai.evaluation.results         (eval-worker, parentSpanId=A)  ← span-exact
+      • event: evaluation.ground_truth { item_id, query, ground_truth }
 ```
 
 The **agent process is never involved in correlation** — the runner creates the
@@ -104,7 +116,9 @@ span's `parent_span_id`, and **asserts** they match (span-exact, same trace).
 
 ## Verify in App Insights (KQL)
 
-Because the eval span's parent is a first-class column, the join is trivial:
+Because the eval span's parent is a first-class column, the join is trivial. The
+ground-truth object is on the eval span's `evaluation.ground_truth` event and in
+its `gen_ai.evaluation.ground_truth` attribute (JSON):
 
 ```kql
 dependencies
@@ -115,6 +129,7 @@ dependencies
 | project timestamp, operation_Id,
           invoke_agent_span = id1,
           eval_parent_span = operation_ParentId,
+          ground_truth = tostring(customDimensions["gen_ai.evaluation.ground_truth"]),
           score = todouble(customDimensions["gen_ai.evaluation.score"])
 ```
 
@@ -128,6 +143,11 @@ dependencies
   deliberate trade for the cheapest, most precise KQL (first-class parent id).
   A peer **span link** or an explicit `evaluated_span_id` attribute are
   alternatives if you want peer semantics instead of nesting.
+- The ground-truth object is attached both as an **event**
+  (`evaluation.ground_truth`, mirroring `trace-ground-truth-poc`) and as a JSON
+  **attribute** (`gen_ai.evaluation.ground_truth`) on the eval span. OTel
+  attribute/event values must be primitives, so structured objects travel as a
+  JSON string.
 - The scorer in `eval_worker._score` is a trivial exact-match stand-in; swap in
   a real evaluator without changing the correlation mechanism.
 - If you also want the agent's *internal* spans in the same trace, enable OTel

@@ -8,17 +8,22 @@ Exposes ``POST /evaluate``. The runner calls it once per dataset row, passing:
 
 The worker rebuilds a remote parent context from that ``traceparent`` and starts
 a ``gen_ai.evaluation.results`` span **as a child of that specific
-invoke_agent span** (span-exact), in the same trace. The evaluation score is set
-as span attributes and exported to App Insights.
+invoke_agent span** (span-exact), in the same trace. It then attaches the full
+**ground-truth object** to that child span as an ``evaluation.ground_truth``
+event (mirroring the single-process ``trace-ground-truth-poc``), and exports it
+to App Insights.
 
 Because the parent is set from the propagated ids -- not a live in-process span
--- this works fully cross-process, and the agent process is never involved.
+-- this works fully cross-process, and the agent process is never involved. The
+ground truth ends up on a span that is a span-exact child of ``invoke_agent``.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+from typing import Any
 
 from dotenv import load_dotenv
 from fastapi import FastAPI
@@ -34,6 +39,7 @@ logger = logging.getLogger("eval-worker")
 SERVICE_NAME = "eval-worker"
 
 EVAL_SPAN_NAME = "gen_ai.evaluation.results"
+GROUND_TRUTH_EVENT = "evaluation.ground_truth"
 
 app = FastAPI(title="span-exact-eval-worker")
 
@@ -46,7 +52,8 @@ class EvaluateRequest(BaseModel):
     item_id: str
     query: str
     response: str
-    ground_truth: str
+    # Full ground-truth object (dict/str/list) to attach to the span.
+    ground_truth: Any
     # traceparent pointing at the specific invoke_agent span for this row.
     invoke_agent_traceparent: str
 
@@ -63,13 +70,24 @@ class EvaluateResponse(BaseModel):
     parent_span_id: str
 
 
-def _score(response: str, ground_truth: str) -> float:
-    """Trivial stand-in scorer (exact-match ratio).
+def _expected_answer(ground_truth: Any) -> str:
+    """Extract the comparable expected answer from a ground-truth object.
+
+    Supports a plain string, or a dict with an ``answer`` key (the object shape
+    used by this POC's dataset).
+    """
+    if isinstance(ground_truth, dict):
+        return str(ground_truth.get("answer", "")).strip().lower()
+    return str(ground_truth).strip().lower()
+
+
+def _score(response: str, ground_truth: Any) -> float:
+    """Trivial stand-in scorer (exact-match containment).
 
     Replace with a real evaluator (e.g. azure-ai-evaluation) as needed; the
     correlation mechanism is independent of the scoring logic.
     """
-    expected = ground_truth.strip().lower()
+    expected = _expected_answer(ground_truth)
     actual = response.strip().lower()
     if not expected:
         return 0.0
@@ -98,11 +116,27 @@ def evaluate(req: EvaluateRequest) -> EvaluateResponse:
     with _tracer.start_as_current_span(
         EVAL_SPAN_NAME, context=parent_ctx
     ) as span:
+        # Serialize the ground-truth object once; OTel attribute/event values
+        # must be primitives, so structured objects travel as a JSON string.
+        ground_truth_json = json.dumps(req.ground_truth, ensure_ascii=False)
+
         span.set_attribute("gen_ai.evaluation.item_id", req.item_id)
         span.set_attribute("gen_ai.evaluation.evaluator", "exact_match")
         span.set_attribute("gen_ai.evaluation.score", score)
-        span.set_attribute("gen_ai.evaluation.ground_truth", req.ground_truth)
+        span.set_attribute("gen_ai.evaluation.ground_truth", ground_truth_json)
         span.set_attribute("gen_ai.evaluation.response", req.response)
+
+        # Attach the FULL ground-truth object as an event on this span --
+        # the same paradigm as trace-ground-truth-poc, but on a span-exact
+        # child of the invoke_agent span (in a separate process).
+        span.add_event(
+            GROUND_TRUTH_EVENT,
+            {
+                "item_id": req.item_id,
+                "query": req.query,
+                "ground_truth": ground_truth_json,
+            },
+        )
 
         eval_ctx = span.get_span_context()
         # The parent traceparent's span_id is the invoke_agent span_id we
