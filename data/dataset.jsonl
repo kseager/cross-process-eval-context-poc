@@ -1,0 +1,3 @@
+{"id": "1", "query": "What is the capital of France?", "ground_truth": "Paris"}
+{"id": "2", "query": "What is 2 + 2?", "ground_truth": "4"}
+{"id": "3", "query": "Who wrote Romeo and Juliet?", "ground_truth": "William Shakespeare"}
