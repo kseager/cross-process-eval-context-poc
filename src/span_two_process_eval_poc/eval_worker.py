@@ -42,6 +42,7 @@ from opentelemetry.trace import Status, StatusCode
 from dotenv import load_dotenv
 
 from .dataset import load_dataset
+from .evaluation import check_evaluation_results, evaluate_traces
 from .telemetry import setup_observability
 from .trace_context import traceparent_for_span
 
@@ -203,6 +204,35 @@ def cli() -> None:
             'ground_truth = tostring(customDimensions["gen_ai.evaluation.ground_truth"])\n'
             "| order by timestamp asc"
         )
+
+    # -- Evaluation (post-processing) -----------------------------------------
+    # After every agent invocation has produced a trace, evaluate those traces
+    # BY TRACE ID with Foundry's built-in evaluators. This is the "separate
+    # post-processing step" referenced above -- it does NOT run inline per item.
+    # Gated behind RUN_EVALUATION (default: on) so the driver can be run purely
+    # to emit traces if desired.
+    if os.environ.get("RUN_EVALUATION", "true").lower() not in ("1", "true", "yes"):
+        print("\nRUN_EVALUATION disabled; skipping trace evaluation.")
+        return
+
+    # Only evaluate traces whose agent call actually succeeded; a trace from a
+    # failed agent call has no response for the evaluators to score.
+    eval_trace_ids = [r["operation_id"] for r in results if r["status"] == "OK"]
+    if not eval_trace_ids:
+        print("\nNo successful traces to evaluate; skipping evaluation.")
+        return
+
+    lookback_hours = int(os.environ.get("EVAL_LOOKBACK_HOURS", "1"))
+    print(
+        f"\n=== Evaluating {len(eval_trace_ids)} trace(s) by trace_id "
+        f"(lookback {lookback_hours}h) ==="
+    )
+    try:
+        summary = evaluate_traces(eval_trace_ids, lookback_hours=lookback_hours)
+        check_evaluation_results(summary)
+    except Exception as exc:  # noqa: BLE001 - report, don't crash the whole run
+        logger.warning("evaluation step failed: %s", exc)
+        print(f"  evaluation step failed: {exc}")
 
 
 if __name__ == "__main__":
