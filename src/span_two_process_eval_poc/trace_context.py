@@ -59,15 +59,6 @@ def traceparent_for_span(span: trace.Span) -> str:
     return build_traceparent(ctx.trace_id, ctx.span_id, ctx.trace_flags)
 
 
-def traceparent_from_span_context(ctx: SpanContext) -> str:
-    """Build a ``traceparent`` from a captured :class:`SpanContext`.
-
-    Used when we already hold the framework's real ``invoke_agent`` span
-    context (captured via the span processor) rather than a live span object.
-    """
-    return build_traceparent(ctx.trace_id, ctx.span_id, ctx.trace_flags)
-
-
 def parent_context_from_traceparent(traceparent: str) -> Context:
     """Rebuild a *remote* parent :class:`Context` from a ``traceparent``.
 
