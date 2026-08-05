@@ -34,14 +34,10 @@ _propagator = TraceContextTextMapPropagator()
 # ---------------------------------------------------------------------------
 # Shared span/attribute names (single source of truth for both processes).
 # ---------------------------------------------------------------------------
-# The driver-authored wrapper span. NOT an agent invocation: it owns the trace
-# root and carries evaluation metadata (ground truth) so the agent's
-# execute_agent -> chat spans nest beneath it.
+# The driver-authored span that carries evaluation metadata (ground truth). In
+# the attach-after model the agent authors its own invoke_agent span natively;
+# the driver then attaches THIS span as a child of it (same trace, cross-process).
 EVALUATION_CONTEXT_SPAN_NAME = "evaluation_context"
-
-# The span the agent-service opens beneath EVALUATION_CONTEXT_SPAN_NAME,
-# standing in for a hosted agent runtime's own instrumentation (ACA-faithful).
-EXECUTE_AGENT_SPAN_NAME = "execute_agent"
 
 # Custom span attribute carrying the ground-truth object (JSON string).
 GROUND_TRUTH_ATTRIBUTE = "gen_ai.evaluation.ground_truth"
@@ -70,12 +66,6 @@ def build_traceparent(
         f"{format_span_id(span_id)}-"
         f"{flags:02x}"
     )
-
-
-def traceparent_for_span(span: trace.Span) -> str:
-    """Build a ``traceparent`` that points at *span* specifically."""
-    ctx = span.get_span_context()
-    return build_traceparent(ctx.trace_id, ctx.span_id, ctx.trace_flags)
 
 
 def parent_context_from_traceparent(traceparent: str) -> Context:
