@@ -195,7 +195,7 @@ def evaluate_traces(
         logger.info("evaluation created (id=%s)", eval_object.id)
 
         data_source = {
-            "type": "azure_ai_traces",
+            "type": "azure_ai_traces_preview",
             "trace_ids": list(trace_ids),
             "lookback_hours": lookback_hours,
         }
