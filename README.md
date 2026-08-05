@@ -14,14 +14,88 @@ It combines two ideas:
   span.
 - **Remote-agent reality (ACA-faithful)**: the **eval-worker** (the driver)
   **authors** the `invoke_agent` span and calls the agent as a **separate HTTP
-  service**, injecting a W3C `traceparent` header. The agent is a *passive
-  header recipient* — its own framework instrumentation emits an
-  `invoke_agent <agent_name>` span nested under the driver's `invoke_agent`, and
-  it needs **no** tracing code of its own.
+  service**, injecting a W3C `traceparent` header. The agent-service opens an
+  `execute_agent` span beneath it (matching ACA's
+  `invoke_agent → execute_agent → chat`), and the agent itself needs **no**
+  tracing code of its own.
 
 Net result: the ground-truth object lands **directly on the `invoke_agent`
 span** authored by the driver, and the remote agent's framework spans nest
 underneath it in the same trace.
+
+## Adopt this with your own agent (BYO agent)
+
+You do **not** need to understand or touch any of the tracing internals
+(`invoke_agent`, `execute_agent`, `traceparent`, span processors, telemetry
+setup). Treat the agent as a **black box**. The harness wraps it, drives it, and
+produces the trace for you.
+
+**The only file you edit is [`src/span_two_process_eval_poc/agent.py`](src/span_two_process_eval_poc/agent.py).**
+Replace the body of `build_agent()` so it returns *your* agent. Everything else
+stays exactly as shipped.
+
+### Step 1 — plug in your agent
+
+`build_agent()` must return an object with an **async `run(query: str)` method**
+that returns the agent's answer (any object; it is stringified). That is the
+only contract.
+
+```python
+# src/span_two_process_eval_poc/agent.py
+def build_agent():
+    # Build and return YOUR agent however you normally do.
+    # No tracing, no spans, no OpenTelemetry — just your agent.
+    return MyAgent(...)          # must expose:  async def run(self, query: str)
+```
+
+If your agent already uses the Microsoft Agent Framework, you can keep the
+shipped implementation and only change the model/instructions. If it is a
+LangChain / custom / HTTP agent, wrap it in a tiny class:
+
+```python
+class MyAgentAdapter:
+    def __init__(self, my_agent):
+        self._agent = my_agent
+    async def run(self, query: str) -> str:
+        return await self._agent.ainvoke(query)   # adapt to your API
+```
+
+### Step 2 — configure `.env`
+
+```
+cp .env.example .env
+```
+
+Fill in your model endpoint / deployment and your **Application Insights
+connection string** (where traces are sent). Nothing here is about tracing
+mechanics — just credentials and the destination.
+
+### Step 3 — run it (two processes)
+
+```bash
+uv sync
+
+# 1. start the agent host (wraps your build_agent())
+uv run uvicorn span_two_process_eval_poc.agent_service:app --port 8002
+
+# 2. in another terminal, run the driver over your dataset
+uv run run-poc --dataset data/dataset.jsonl
+```
+
+Put your `query` / `ground_truth` pairs in `data/dataset.jsonl` (one JSON object
+per line; `ground_truth` can be a string or a structured object).
+
+### That's it
+
+The driver prints an `operation_Id` per row and a ready-to-paste KQL query. Open
+App Insights → Logs, paste it, and you'll see each trace with your ground truth
+attached to the `invoke_agent` span. **You never wrote a line of telemetry
+code.**
+
+> **What you do NOT touch:** `eval_worker.py`, `agent_service.py`,
+> `trace_context.py`, `telemetry.py`, and the `execute_agent` / `traceparent`
+> wiring are the harness. They are shipped as-is and require no changes. The
+> agent is a black box behind `build_agent()`.
 
 ## Why this design
 
@@ -33,9 +107,9 @@ underneath it in the same trace.
 | Agent code changes | n/a (single process) | **None** — the driver authors `invoke_agent` and injects `traceparent`; the remote agent just receives the header |
 
 The `invoke_agent` span is authored by the driver and carries the ground truth.
-The remote agent's framework `invoke_agent <agent_name>` span nests under it
-(via the propagated `traceparent`), so the whole invocation — request, agent
-work, and ground truth — lives in one coherent span subtree.
+The remote agent-service's `execute_agent` span nests under it (via the
+propagated `traceparent`), so the whole invocation — request, agent work, and
+ground truth — lives in one coherent span subtree.
 
 ## Requirements
 
@@ -50,8 +124,8 @@ nice-to-have.
    concurrently).
 3. **No agent-process code changes.** The agent/target process must require
    **zero** tracing code — the driver authors `invoke_agent` and injects a
-   `traceparent` header; the remote agent's own framework instrumentation emits
-   `invoke_agent <agent_name>` beneath it. Only the driver is ours to instrument.
+   `traceparent` header; the agent-service opens `execute_agent` beneath it.
+   The agent itself is a black box behind `build_agent()`.
 4. **Attach a ground-truth object only.** Carry a structured ground-truth object
    (not a bare string). **No scores or results** are attached here — only
    evaluation *input*.
@@ -178,8 +252,8 @@ ready-to-paste App Insights KQL query.
 ## Verify in App Insights (KQL)
 
 The ground truth is a JSON **attribute on the `invoke_agent` span itself**, so no
-join is needed — query the span directly. The remote agent's framework
-`invoke_agent <agent_name>` span nests under it via `operation_ParentId`:
+join is needed — query the span directly. The remote agent-service's
+`execute_agent` span nests under it via `operation_ParentId`:
 
 ```kql
 dependencies
@@ -187,8 +261,8 @@ dependencies
 | project timestamp, operation_Id,
           invoke_agent_span = id,
           ground_truth = tostring(customDimensions["gen_ai.evaluation.ground_truth"])
-// The remote agent's framework span nests under invoke_agent:
-//   dependencies | where name startswith "invoke_agent"
+// The remote agent-service's execute_agent span nests under invoke_agent:
+//   dependencies | where name == "execute_agent"
 //   | where operation_ParentId == <invoke_agent id>
 ```
 
@@ -210,13 +284,11 @@ union traces, dependencies, requests, exceptions
   authors — there is no separate eval/child span. OTel attribute values must be
   primitives, so the structured object travels as a JSON string.
 - The driver **authors** the `invoke_agent` span; the agent is a **remote
-  service** whose framework instrumentation emits `invoke_agent <agent_name>`
-  beneath it via the propagated `traceparent` header. Two nested `invoke_agent`
-  spans is the expected ACA shape (`target_util.invoke_agent_with_tracing`): the
-  outer driver span carries the ground truth, the inner framework span carries
-  the agent payload, and the trace consumer reconciles them via parent-chain
-  dedup. Stamping ground truth on the driver's span is authoritative — the agent
-  needs no tracing code.
+  service** that opens an `execute_agent` span beneath it via the propagated
+  `traceparent` header. This matches ACA's hierarchy
+  (`invoke_agent → execute_agent → chat`): the driver span carries the ground
+  truth, the `execute_agent` span carries the agent payload. Stamping ground
+  truth on the driver's span is authoritative — the agent needs no tracing code.
 - Evaluation/scoring is **not** performed here — only ground-truth *input* is
   attached. Scoring is a separate **post-processing** step run after all agent
   invocations complete (read the spans back from App Insights and compute
