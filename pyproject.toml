@@ -18,7 +18,7 @@ dependencies = [
 ]
 
 [project.scripts]
-run-poc = "span_two_process_eval_poc.runner:cli"
+run-poc = "span_two_process_eval_poc.eval_worker:cli"
 
 [build-system]
 requires = ["hatchling"]

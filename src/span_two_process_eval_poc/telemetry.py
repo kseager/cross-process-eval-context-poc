@@ -1,13 +1,13 @@
 """Observability setup.
 
 Configures OpenTelemetry to export traces to Azure Monitor / Application
-Insights. Both processes (runner and evaluator) call :func:`setup_observability`
-so their spans land in the same App Insights resource and can be joined by id.
+Insights. Both processes (the eval-worker driver and the agent-service) call
+:func:`setup_observability` so their spans land in the same App Insights
+resource and share one trace.
 
 The ``service_name`` is surfaced as ``cloud_RoleName`` in App Insights, so the
-runner-created ``invoke_agent`` span and the evaluator-created
-``gen_ai.evaluation.input`` span are attributable to distinct roles while
-sharing one trace.
+driver-authored ``invoke_agent`` span and the agent-service ``execute_agent``
+span are attributable to distinct roles while sharing one trace.
 """
 
 from __future__ import annotations

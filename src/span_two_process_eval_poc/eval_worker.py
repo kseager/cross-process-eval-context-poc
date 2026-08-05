@@ -1,142 +1,146 @@
-"""Ground-truth attach worker -- a **separate process** from the runner.
+"""Eval-worker -- the **main driver loop** of the POC.
 
-Exposes ``POST /evaluate``. The runner calls it once per dataset row, passing:
+This process owns the execution loop. For every dataset row it:
 
-* ``invoke_agent_traceparent`` -- a W3C ``traceparent`` pointing at *exactly*
-  the framework's ``invoke_agent`` span for this row, and
-* the ground-truth data (``item_id``, ``query``, ``ground_truth``).
+1. **Authors** an ``invoke_agent`` span and builds a W3C ``traceparent`` that
+   points at it.
+2. **Invokes the agent** -- a *separate* HTTP service (``AGENT_SERVICE_URL``) --
+   passing the ``traceparent`` as a request header so the agent opens its
+   ``execute_agent`` span *under* this ``invoke_agent`` span. The agent process
+   needs no tracing code; it is a passive header recipient.
+3. Sets the **ground-truth object** directly as an **attribute on the
+   ``invoke_agent`` span** it created (no separate child span).
 
-The worker rebuilds a remote parent context from that ``traceparent`` and starts
-a ``gen_ai.evaluation.input`` span **as a child of that specific
-invoke_agent span** (span-exact), in the same trace. It attaches **only the
-ground-truth object** to that child span (as an ``evaluation.ground_truth``
-event plus a JSON attribute), mirroring the single-process
-``trace-ground-truth-poc``, and exports it to App Insights.
+Resulting span tree (one trace)::
 
-IMPORTANT -- this worker does NOT evaluate. It only attaches ground-truth
-*input* to the correct span. Actual evaluation (scoring the agent's responses
-against this ground truth) is a **separate post-processing step that runs after
-all agent invocations have completed** -- e.g. a batch job that reads these
-spans back from App Insights and computes metrics. That step is out of scope for
-this POC, which proves only span-exact ground-truth attachment.
+    invoke_agent                       (this process, span_id=A)
+    │  • attribute: gen_ai.evaluation.ground_truth = {...}
+    └─ execute_agent                   (agent-service, via traceparent header)
+        └─ chat ...                    (agent framework)
 
-Because the parent is set from the propagated ids -- not a live in-process span
--- this works fully cross-process, and the agent process is never involved.
+The eval-worker only *attaches ground-truth input*. Actual evaluation (scoring
+the agent's responses against this ground truth) is a **separate post-processing
+step that runs after all agent invocations complete** -- e.g. a batch job that
+reads these spans back from App Insights and computes metrics. That step is
+intentionally out of scope for this POC.
 """
 
 from __future__ import annotations
 
+import argparse
+import asyncio
 import json
 import logging
 import os
+from pathlib import Path
 from typing import Any
 
+import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI
-from opentelemetry.trace import Tracer
-from pydantic import BaseModel
 
+from .dataset import load_dataset
 from .telemetry import setup_observability
-from .trace_context import parent_context_from_traceparent, traceparent_for_span
+from .trace_context import traceparent_for_span
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("eval-worker")
 
 SERVICE_NAME = "eval-worker"
 
-EVAL_SPAN_NAME = "gen_ai.evaluation.input"
-GROUND_TRUTH_EVENT = "evaluation.ground_truth"
+GROUND_TRUTH_ATTRIBUTE = "gen_ai.evaluation.ground_truth"
 
-app = FastAPI(title="span-exact-eval-worker")
-
-_tracer: Tracer | None = None
-
-
-class EvaluateRequest(BaseModel):
-    """Payload the runner sends per row (ground-truth attach only)."""
-
-    item_id: str
-    query: str
-    # Full ground-truth object (dict/str/list) to attach to the span.
-    ground_truth: Any
-    # traceparent pointing at the specific invoke_agent span for this row.
-    invoke_agent_traceparent: str
+DEFAULT_DATASET = (
+    Path(__file__).resolve().parents[2] / "data" / "dataset.jsonl"
+)
+DEFAULT_AGENT_SERVICE_URL = "http://localhost:8002/invoke"
 
 
-class EvaluateResponse(BaseModel):
-    """What the worker returns, echoing the correlation ids for verification."""
+async def run(dataset_path: Path, agent_service_url: str) -> None:
+    """Drive the loop: author invoke_agent, call the agent, stamp ground truth.
 
-    item_id: str
-    # The ground-truth span's own ids and the parent it was attached to.
-    ground_truth_trace_id: str
-    ground_truth_span_id: str
-    parent_span_id: str
-
-
-@app.on_event("startup")
-def _startup() -> None:
-    global _tracer
-    load_dotenv()
-    _tracer = setup_observability(SERVICE_NAME)
-    logger.info("eval-worker observability configured")
-
-
-@app.post("/evaluate", response_model=EvaluateResponse)
-def evaluate(req: EvaluateRequest) -> EvaluateResponse:
-    """Attach ground-truth input to a span-exact child of invoke_agent.
-
-    Creates a ``gen_ai.evaluation.input`` span parented to the exact
-    ``invoke_agent`` span (via the propagated traceparent) and attaches the
-    ground-truth object to it. The span represents evaluation *input* (ground
-    truth) only -- no scoring happens here (see module docstring: evaluation is
-    a separate post-processing step run after all agent invocations).
+    The ground-truth object is set as an attribute directly on the
+    ``invoke_agent`` span this process creates -- there is no separate eval span.
     """
-    assert _tracer is not None, "tracer not initialized"
+    tracer = setup_observability(SERVICE_NAME)
 
-    # Rebuild the remote parent from the propagated invoke_agent traceparent.
-    parent_ctx = parent_context_from_traceparent(req.invoke_agent_traceparent)
+    rows = list(load_dataset(dataset_path))
 
-    # Start the ground-truth span AS A CHILD of the specific invoke_agent span.
-    with _tracer.start_as_current_span(
-        EVAL_SPAN_NAME, context=parent_ctx
-    ) as span:
-        # Serialize the ground-truth object once; OTel attribute/event values
-        # must be primitives, so structured objects travel as a JSON string.
-        ground_truth_json = json.dumps(req.ground_truth, ensure_ascii=False)
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        for item in rows:
+            print(f"\n[{item.id}]")
+            print(f"  query        : {item.query}")
 
-        # Attach ONLY the ground truth -- no score, evaluator, or response.
-        span.set_attribute("gen_ai.evaluation.item_id", req.item_id)
-        span.set_attribute("gen_ai.evaluation.ground_truth", ground_truth_json)
+            # Author the invoke_agent span; the agent is a remote service that
+            # emits execute_agent (not invoke_agent) beneath it.
+            with tracer.start_as_current_span("invoke_agent") as span:
+                span_ctx = span.get_span_context()
+                invoke_agent_traceparent = traceparent_for_span(span)
+                print(
+                    f"  invoke_agent : trace_id={span_ctx.trace_id:032x} "
+                    f"span_id={span_ctx.span_id:016x}"
+                )
 
-        # Attach the FULL ground-truth object as an event on this span --
-        # the same paradigm as trace-ground-truth-poc, but on a span-exact
-        # child of the invoke_agent span (in a separate process).
-        span.add_event(
-            GROUND_TRUTH_EVENT,
-            {
-                "item_id": req.item_id,
-                "query": req.query,
-                "ground_truth": ground_truth_json,
-            },
-        )
+                # Invoke the REMOTE agent, injecting the traceparent as a header
+                # so its execute_agent span nests under this invoke_agent span.
+                agent_resp = await client.post(
+                    agent_service_url,
+                    json={"item_id": item.id, "query": item.query},
+                    headers={"traceparent": invoke_agent_traceparent},
+                )
+                agent_resp.raise_for_status()
+                agent_result = agent_resp.json()
+                response_text = agent_result["response"]
 
-        gt_ctx = span.get_span_context()
-        # The parent traceparent's span_id is the invoke_agent span_id we
-        # attached to; echo it back for verification/logging.
-        parent_span_id = req.invoke_agent_traceparent.split("-")[2]
+                # Attach the ground-truth object DIRECTLY on the invoke_agent
+                # span. OTel attribute values must be primitives, so structured
+                # objects travel as a JSON string. Ground truth only -- no score.
+                ground_truth_json = json.dumps(
+                    item.ground_truth, ensure_ascii=False
+                )
+                span.set_attribute("gen_ai.evaluation.item_id", item.id)
+                span.set_attribute(GROUND_TRUTH_ATTRIBUTE, ground_truth_json)
 
-        logger.info(
-            "ground-truth span %s (trace=%s) attached to invoke_agent span %s "
-            "(item=%s)",
-            traceparent_for_span(span).split("-")[2],
-            f"{gt_ctx.trace_id:032x}",
-            parent_span_id,
-            req.item_id,
-        )
+            print(f"  response     : {response_text}")
+            print(f"  ground_truth : {item.ground_truth}")
+            print(
+                f"  execute_agent: span_id={agent_result['execute_agent_span_id']} "
+                f"(child of invoke_agent)"
+            )
 
-        return EvaluateResponse(
-            item_id=req.item_id,
-            ground_truth_trace_id=f"{gt_ctx.trace_id:032x}",
-            ground_truth_span_id=f"{gt_ctx.span_id:016x}",
-            parent_span_id=parent_span_id,
-        )
+            # Sanity check: the agent's execute_agent span must correlate to
+            # this invoke_agent span (same trace, parented to it).
+            assert (
+                agent_result["execute_agent_trace_id"]
+                == f"{span_ctx.trace_id:032x}"
+            ), "execute_agent is not in the same trace as invoke_agent"
+
+
+def cli() -> None:
+    """Parse arguments, load config, and run the driver loop."""
+    load_dotenv()
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--dataset",
+        type=Path,
+        default=Path(os.environ.get("DATASET_PATH", DEFAULT_DATASET)),
+        help="Path to the JSONL dataset file.",
+    )
+    parser.add_argument(
+        "--agent-service-url",
+        type=str,
+        default=os.environ.get("AGENT_SERVICE_URL", DEFAULT_AGENT_SERVICE_URL),
+        help="URL of the agent-service /invoke endpoint.",
+    )
+    args = parser.parse_args()
+
+    asyncio.run(run(args.dataset, args.agent_service_url))
+    print(
+        "\nDone. invoke_agent (with ground_truth attribute) + execute_agent "
+        "exported to App Insights. Evaluation itself is a separate "
+        "post-processing step."
+    )
+
+
+if __name__ == "__main__":
+    cli()
