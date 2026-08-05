@@ -1,16 +1,17 @@
 """Agent service -- a **separate process** that hosts the agent over HTTP.
 
 This mirrors the ACA topology (Yingying's design): the agent is a **remote
-service**, not an in-process object. The runner authors the ``invoke_agent``
-span and injects a W3C ``traceparent`` header pointing at it; this service is a
-**passive header recipient** -- it rebuilds that remote parent and opens its own
-``execute_agent`` span *underneath* ``invoke_agent``, then runs the model.
+service**, not an in-process object. The runner authors the
+``evaluation_context`` span and injects a W3C ``traceparent`` header pointing at
+it; this service is a **passive header recipient** -- it rebuilds that remote
+parent and opens its own ``execute_agent`` span *underneath*
+``evaluation_context``, then runs the model.
 
-Crucially, this service does **not** emit an ``invoke_agent`` span -- that span
+Crucially, this service does **not** author the wrapper span -- that span
 belongs to the runner. It emits ``execute_agent`` (and the framework's own
 ``chat`` spans nest under it), exactly like ACA's::
 
-    [invoke_agent]        (runner)
+    [evaluation_context]  (runner)
     ↳ [execute_agent]     (this service, via traceparent header)
         ↳ [chat ...]      (agent framework)
 
@@ -34,13 +35,15 @@ from agent_framework._agents import RawAgent
 from .agent import build_agent
 
 from .telemetry import setup_observability
-from .trace_context import parent_context_from_traceparent
+from .trace_context import (
+    EXECUTE_AGENT_SPAN_NAME,
+    parent_context_from_traceparent,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("agent-service")
 
 SERVICE_NAME = "agent-service"
-EXECUTE_AGENT_SPAN_NAME = "execute_agent"
 
 app = FastAPI(title="agent-service")
 
@@ -80,13 +83,14 @@ async def invoke(
     req: InvokeRequest,
     traceparent: str | None = Header(default=None),
 ) -> InvokeResponse:
-    """Run the agent under an ``execute_agent`` span parented to invoke_agent.
+    """Run the agent under an ``execute_agent`` span parented to the driver's
+    ``evaluation_context`` span.
 
-    The driver passes ``traceparent`` (pointing at its ``invoke_agent`` span) as
-    an HTTP header. We rebuild that remote parent and open an ``execute_agent``
-    span beneath it -- matching ACA's hierarchy
-    (``invoke_agent -> execute_agent -> chat``), where the remote hosted-agent
-    runtime authors ``execute_agent``.
+    The driver passes ``traceparent`` (pointing at its ``evaluation_context``
+    span) as an HTTP header. We rebuild that remote parent and open an
+    ``execute_agent`` span beneath it -- matching ACA's hierarchy
+    (``evaluation_context -> execute_agent -> chat``), where the remote
+    hosted-agent runtime authors ``execute_agent``.
 
     Because our agent runs *locally* (not via Foundry's hosted runtime), we run
     it through ``RawAgent.run`` to bypass Agent Framework's ``AgentTelemetryLayer``
@@ -98,7 +102,7 @@ async def invoke(
     """
     assert _tracer is not None and _agent is not None, "service not initialized"
 
-    # Rebuild the driver's invoke_agent span as a remote parent from the header.
+    # Rebuild the driver's evaluation_context span as a remote parent.
     parent_ctx = parent_context_from_traceparent(traceparent) if traceparent else None
 
     with _tracer.start_as_current_span(

@@ -2,7 +2,7 @@
 
 This module is the heart of the POC. It lets one process create a span that is
 a child of *exactly one* span created in another process (e.g. the driver's
-``invoke_agent`` span), by carrying that span's identity as a W3C
+``evaluation_context`` span), by carrying that span's identity as a W3C
 ``traceparent`` string.
 
 Key idea
@@ -30,6 +30,21 @@ from opentelemetry.trace.propagation.tracecontext import (
 
 _TRACEPARENT_HEADER = "traceparent"
 _propagator = TraceContextTextMapPropagator()
+
+# ---------------------------------------------------------------------------
+# Shared span/attribute names (single source of truth for both processes).
+# ---------------------------------------------------------------------------
+# The driver-authored wrapper span. NOT an agent invocation: it owns the trace
+# root and carries evaluation metadata (ground truth) so the agent's
+# execute_agent -> chat spans nest beneath it.
+EVALUATION_CONTEXT_SPAN_NAME = "evaluation_context"
+
+# The span the agent-service opens beneath EVALUATION_CONTEXT_SPAN_NAME,
+# standing in for a hosted agent runtime's own instrumentation (ACA-faithful).
+EXECUTE_AGENT_SPAN_NAME = "execute_agent"
+
+# Custom span attribute carrying the ground-truth object (JSON string).
+GROUND_TRUTH_ATTRIBUTE = "gen_ai.evaluation.ground_truth"
 
 _TRACEPARENT_VERSION = "00"
 

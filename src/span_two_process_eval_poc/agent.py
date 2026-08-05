@@ -2,7 +2,8 @@
 
 This is deliberately identical to an ordinary Foundry-backed agent: the whole
 point of the POC is that the *agent* process needs **no** special code for
-span-exact evaluation correlation. The runner owns the ``invoke_agent`` span and
+span-exact evaluation correlation. The runner owns the ``evaluation_context``
+span and
 injects trace context; the agent just runs.
 """
 

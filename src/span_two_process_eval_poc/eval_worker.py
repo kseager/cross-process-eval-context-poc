@@ -2,19 +2,19 @@
 
 This process owns the execution loop. For every dataset row it:
 
-1. **Authors** an ``invoke_agent`` span and builds a W3C ``traceparent`` that
-   points at it.
+1. **Authors** an ``evaluation_context`` span and builds a W3C ``traceparent``
+   that points at it.
 2. **Invokes the agent** -- a *separate* HTTP service (``AGENT_SERVICE_URL``) --
    passing the ``traceparent`` as a request header so the agent-service opens an
-   ``execute_agent`` span *under* this ``invoke_agent`` span (matching ACA's
-   ``invoke_agent -> execute_agent -> chat`` hierarchy). The agent *code* needs
+   ``execute_agent`` span *under* this ``evaluation_context`` span (matching
+   ACA's ``execute_agent -> chat`` hierarchy). The agent *code* needs
    no tracing changes; the service just runs it beneath ``execute_agent``.
 3. Sets the **ground-truth object** directly as an **attribute on the
-   ``invoke_agent`` span** it created (no separate child span).
+   ``evaluation_context`` span** it created (no separate child span).
 
 Resulting span tree (one trace)::
 
-    invoke_agent                       (this process, span_id=A)
+    evaluation_context                 (this process, span_id=A)
     │  • attribute: gen_ai.evaluation.ground_truth = {...}
     └─ execute_agent                   (agent-service, via traceparent header)
         └─ chat ...                    (agent framework)
@@ -23,7 +23,7 @@ The eval-worker only *attaches ground-truth input*. Actual evaluation (scoring
 the agent's responses against this ground truth) is a **separate post-processing
 step that runs after all agent invocations complete** -- e.g. a batch job that
 reads these spans back from App Insights and computes metrics. That step is
-intentionally out of scope for this POC.
+opt-in via ``--evaluate`` / ``RUN_EVALUATION`` and can be skipped entirely.
 """
 
 from __future__ import annotations
@@ -44,14 +44,16 @@ from dotenv import load_dotenv
 from .dataset import load_dataset
 from .evaluation import check_evaluation_results, evaluate_traces
 from .telemetry import setup_observability
-from .trace_context import traceparent_for_span
+from .trace_context import (
+    EVALUATION_CONTEXT_SPAN_NAME,
+    GROUND_TRUTH_ATTRIBUTE,
+    traceparent_for_span,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("eval-worker")
 
 SERVICE_NAME = "eval-worker"
-
-GROUND_TRUTH_ATTRIBUTE = "gen_ai.evaluation.ground_truth"
 
 DEFAULT_DATASET = (
     Path(__file__).resolve().parents[2] / "data" / "dataset.jsonl"
@@ -60,10 +62,11 @@ DEFAULT_AGENT_SERVICE_URL = "http://localhost:8002/invoke"
 
 
 async def run(dataset_path: Path, agent_service_url: str) -> list[dict[str, str]]:
-    """Drive the loop: author invoke_agent, call the agent, stamp ground truth.
+    """Drive the loop: author evaluation_context, call the agent, stamp GT.
 
     The ground-truth object is set as an attribute directly on the
-    ``invoke_agent`` span this process creates -- there is no separate eval span.
+    ``evaluation_context`` span this process creates -- there is no separate
+    eval span.
     """
     os.environ.setdefault("OTEL_SERVICE_NAME", SERVICE_NAME)
     setup_observability()
@@ -73,7 +76,7 @@ async def run(dataset_path: Path, agent_service_url: str) -> list[dict[str, str]
 
     # Collected for an App Insights lookup summary at the end. operation_Id in
     # App Insights == the OTel trace_id (hex), so this is what you paste into a
-    # Transaction search / KQL query to find each run's invoke_agent span.
+    # Transaction search / KQL query to find each run's evaluation_context span.
     results: list[dict[str, str]] = []
 
     async with httpx.AsyncClient(timeout=120.0) as client:
@@ -81,23 +84,24 @@ async def run(dataset_path: Path, agent_service_url: str) -> list[dict[str, str]
             print(f"\n[{item.id}]")
             print(f"  query        : {item.query}")
 
-            # Author the invoke_agent span; the agent-service opens execute_agent
-            # (ACA-style) beneath it via the traceparent header.
-            with tracer.start_as_current_span("invoke_agent") as span:
+            # Author the evaluation_context span; the agent-service opens
+            # execute_agent (ACA-style) beneath it via the traceparent header.
+            with tracer.start_as_current_span(EVALUATION_CONTEXT_SPAN_NAME) as span:
                 span_ctx = span.get_span_context()
                 operation_id = f"{span_ctx.trace_id:032x}"
                 invoke_agent_traceparent = traceparent_for_span(span)
                 print(
-                    f"  invoke_agent : trace_id={operation_id} "
+                    f"  eval_context : trace_id={operation_id} "
                     f"span_id={span_ctx.span_id:016x}"
                 )
                 print(f"  operation_Id : {operation_id}  (App Insights)")
 
-                # Attach the ground-truth object DIRECTLY on the invoke_agent
-                # span. OTel attribute values must be primitives, so structured
-                # objects travel as a JSON string. Ground truth is driver-owned
-                # input, so it is stamped regardless of whether the agent call
-                # succeeds. Ground truth only -- no score.
+                # Attach the ground-truth object DIRECTLY on the
+                # evaluation_context span. OTel attribute values must be
+                # primitives, so structured objects travel as a JSON string.
+                # Ground truth is driver-owned input, so it is stamped
+                # regardless of whether the agent call succeeds. Ground truth
+                # only -- no score.
                 ground_truth_json = json.dumps(
                     item.ground_truth, ensure_ascii=False
                 )
@@ -105,7 +109,8 @@ async def run(dataset_path: Path, agent_service_url: str) -> list[dict[str, str]
                 span.set_attribute(GROUND_TRUTH_ATTRIBUTE, ground_truth_json)
 
                 # Invoke the REMOTE agent, injecting the traceparent as a header
-                # so its execute_agent span nests under this invoke_agent span.
+                # so its execute_agent span nests under this
+                # evaluation_context span.
                 try:
                     agent_resp = await client.post(
                         agent_service_url,
@@ -136,15 +141,15 @@ async def run(dataset_path: Path, agent_service_url: str) -> list[dict[str, str]
             print(f"  ground_truth : {item.ground_truth}")
             print(
                 f"  execute_agent: span_id={agent_result['execute_agent_span_id']} "
-                f"(child of invoke_agent)"
+                f"(child of evaluation_context)"
             )
 
             # Sanity check: the agent's execute_agent span must correlate to
-            # this invoke_agent span (same trace).
+            # this evaluation_context span (same trace).
             assert (
                 agent_result["execute_agent_trace_id"]
                 == f"{span_ctx.trace_id:032x}"
-            ), "execute_agent is not in the same trace as invoke_agent"
+            ), "execute_agent is not in the same trace as evaluation_context"
 
             results.append(
                 {
@@ -176,14 +181,23 @@ def cli() -> None:
         default=os.environ.get("AGENT_SERVICE_URL", DEFAULT_AGENT_SERVICE_URL),
         help="URL of the agent-service /invoke endpoint.",
     )
+    parser.add_argument(
+        "--evaluate",
+        action="store_true",
+        default=None,
+        help=(
+            "Run the post-processing trace evaluation step after emitting "
+            "traces. Off by default. Can also be enabled via RUN_EVALUATION=1."
+        ),
+    )
     args = parser.parse_args()
 
     results = asyncio.run(run(args.dataset, args.agent_service_url))
 
     print(
-        "\nDone. invoke_agent (with ground_truth attribute) + execute_agent "
-        "exported to App Insights. Evaluation itself is a separate "
-        "post-processing step."
+        "\nDone. evaluation_context (with ground_truth attribute) + "
+        "execute_agent exported to App Insights. Evaluation itself is a "
+        "separate post-processing step."
     )
 
     # App Insights lookup summary. operation_Id == the OTel trace_id.
@@ -209,10 +223,16 @@ def cli() -> None:
     # After every agent invocation has produced a trace, evaluate those traces
     # BY TRACE ID with Foundry's built-in evaluators. This is the "separate
     # post-processing step" referenced above -- it does NOT run inline per item.
-    # Gated behind RUN_EVALUATION (default: on) so the driver can be run purely
-    # to emit traces if desired.
-    if os.environ.get("RUN_EVALUATION", "true").lower() not in ("1", "true", "yes"):
-        print("\nRUN_EVALUATION disabled; skipping trace evaluation.")
+    # OPT-IN: off by default. Enable with --evaluate or RUN_EVALUATION=1 so the
+    # driver can be run purely to emit traces (e.g. to validate the trace shape
+    # without needing eval-service auth).
+    env_eval = os.environ.get("RUN_EVALUATION", "").lower() in ("1", "true", "yes")
+    run_eval = bool(args.evaluate) or env_eval
+    if not run_eval:
+        print(
+            "\nEvaluation step skipped (pass --evaluate or set RUN_EVALUATION=1 "
+            "to enable)."
+        )
         return
 
     # Only evaluate traces whose agent call actually succeeded; a trace from a
