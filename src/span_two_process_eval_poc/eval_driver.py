@@ -49,9 +49,9 @@ from .trace_context import (
 )
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("attach-after")
+logger = logging.getLogger("eval-driver")
 
-SERVICE_NAME = "attach-after-driver"
+SERVICE_NAME = "eval-driver"
 
 DEFAULT_DATASET = Path(__file__).resolve().parents[2] / "data" / "dataset.jsonl"
 DEFAULT_AGENT_SERVICE_URL = "http://localhost:8002/invoke-standalone"
