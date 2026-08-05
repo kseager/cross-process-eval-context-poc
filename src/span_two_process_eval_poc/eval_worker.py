@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+from opentelemetry import trace
 from dotenv import load_dotenv
 
 from .dataset import load_dataset
@@ -61,7 +62,9 @@ async def run(dataset_path: Path, agent_service_url: str) -> None:
     The ground-truth object is set as an attribute directly on the
     ``invoke_agent`` span this process creates -- there is no separate eval span.
     """
-    tracer = setup_observability(SERVICE_NAME)
+    os.environ.setdefault("OTEL_SERVICE_NAME", SERVICE_NAME)
+    setup_observability()
+    tracer = trace.get_tracer(SERVICE_NAME)
 
     rows = list(load_dataset(dataset_path))
 

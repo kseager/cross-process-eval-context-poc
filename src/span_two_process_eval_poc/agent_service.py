@@ -21,9 +21,11 @@ wrapper here stands in for the remote agent runtime's own instrumentation.
 from __future__ import annotations
 
 import logging
+import os
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header
+from opentelemetry import trace
 from opentelemetry.trace import Tracer
 from pydantic import BaseModel
 
@@ -63,7 +65,9 @@ class InvokeResponse(BaseModel):
 def _startup() -> None:
     global _tracer, _agent
     load_dotenv()
-    _tracer = setup_observability(SERVICE_NAME)
+    os.environ.setdefault("OTEL_SERVICE_NAME", SERVICE_NAME)
+    setup_observability()
+    _tracer = trace.get_tracer(SERVICE_NAME)
     _agent = build_agent()
     logger.info("agent-service observability + agent configured")
 
