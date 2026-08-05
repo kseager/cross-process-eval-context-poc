@@ -1,8 +1,8 @@
 """W3C trace-context helpers for span-exact, cross-process correlation.
 
-This module is the heart of the POC. It lets one process (the evaluator) create
-a span that is a child of *exactly one* span created in another process (the
-runner's ``invoke_agent`` span), by carrying that span's identity as a W3C
+This module is the heart of the POC. It lets one process create a span that is
+a child of *exactly one* span created in another process (e.g. the driver's
+``invoke_agent`` span), by carrying that span's identity as a W3C
 ``traceparent`` string.
 
 Key idea
@@ -20,12 +20,16 @@ from __future__ import annotations
 from opentelemetry import trace
 from opentelemetry.context import Context
 from opentelemetry.trace import (
-    NonRecordingSpan,
-    SpanContext,
     TraceFlags,
     format_span_id,
     format_trace_id,
 )
+from opentelemetry.trace.propagation.tracecontext import (
+    TraceContextTextMapPropagator,
+)
+
+_TRACEPARENT_HEADER = "traceparent"
+_propagator = TraceContextTextMapPropagator()
 
 _TRACEPARENT_VERSION = "00"
 
@@ -62,10 +66,16 @@ def traceparent_for_span(span: trace.Span) -> str:
 def parent_context_from_traceparent(traceparent: str) -> Context:
     """Rebuild a *remote* parent :class:`Context` from a ``traceparent``.
 
-    The returned context wraps a non-recording span whose ``SpanContext``
-    carries the parsed ``(trace_id, span_id)`` and is flagged ``is_remote``.
-    Starting a new span with this context as parent makes the new span a child
-    of exactly the span the ``traceparent`` came from.
+    Uses OpenTelemetry's ``TraceContextTextMapPropagator.extract`` -- the
+    idiomatic W3C parser (the same mechanism ACA's ``trace_utils`` uses) -- so
+    all Trace Context edge cases are handled. Starting a new span with the
+    returned context as parent makes the new span a child of exactly the span
+    the ``traceparent`` came from.
+
+    Unlike the propagator's default lenient behavior (which yields an *invalid*
+    context on a bad header, silently orphaning the child as a new root), this
+    wrapper is **strict**: it raises on missing/malformed input so POC mistakes
+    surface loudly instead of producing a disconnected trace.
 
     Args:
         traceparent: A W3C ``traceparent`` header value.
@@ -75,20 +85,16 @@ def parent_context_from_traceparent(traceparent: str) -> Context:
         ``tracer.start_as_current_span``.
 
     Raises:
-        ValueError: If *traceparent* is not a well-formed W3C value.
+        ValueError: If *traceparent* is missing or not a well-formed W3C value.
     """
-    parts = traceparent.strip().split("-")
-    if len(parts) != 4:
+    if not traceparent:
+        raise ValueError("Empty traceparent")
+
+    ctx = _propagator.extract(carrier={_TRACEPARENT_HEADER: traceparent})
+
+    # The propagator never raises; verify it actually parsed a valid parent.
+    span_context = trace.get_current_span(ctx).get_span_context()
+    if not span_context.is_valid:
         raise ValueError(f"Malformed traceparent: {traceparent!r}")
 
-    _version, trace_id_hex, span_id_hex, flags_hex = parts
-    if len(trace_id_hex) != 32 or len(span_id_hex) != 16:
-        raise ValueError(f"Malformed traceparent ids: {traceparent!r}")
-
-    span_context = SpanContext(
-        trace_id=int(trace_id_hex, 16),
-        span_id=int(span_id_hex, 16),
-        is_remote=True,
-        trace_flags=TraceFlags(int(flags_hex, 16)),
-    )
-    return trace.set_span_in_context(NonRecordingSpan(span_context))
+    return ctx
