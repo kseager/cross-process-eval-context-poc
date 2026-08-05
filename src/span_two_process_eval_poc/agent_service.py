@@ -36,6 +36,7 @@ from .agent import build_agent
 
 from .telemetry import setup_observability
 from .trace_context import (
+    AGENT_INVOCATION_SPAN_NAME,
     EXECUTE_AGENT_SPAN_NAME,
     parent_context_from_traceparent,
 )
@@ -128,4 +129,58 @@ async def invoke(
             response=response_text,
             execute_agent_trace_id=f"{ctx.trace_id:032x}",
             execute_agent_span_id=f"{ctx.span_id:016x}",
+        )
+
+
+class StandaloneResponse(BaseModel):
+    """Agent answer plus the ids of the span the agent authored on its own.
+
+    In the *attach-after* (BYO) model the agent runs with **no** incoming
+    ``traceparent``: it authors its own root span (its natural
+    ``invoke_agent``-style span) and simply reports that span's identity back so
+    the driver can attach an ``evaluation_context`` child span to it afterward.
+    """
+
+    item_id: str
+    response: str
+    agent_trace_id: str
+    agent_span_id: str
+
+
+@app.post("/invoke-standalone", response_model=StandaloneResponse)
+async def invoke_standalone(req: InvokeRequest) -> StandaloneResponse:
+    """Run the agent as a black box and return the id of the span it authored.
+
+    This mirrors Ankit's *attach-after* idea: the request path has **zero**
+    tracing coupling -- no ``traceparent`` header, no context injection, no
+    ``RawAgent`` bypass. The agent runs exactly as it normally would and emits
+    its own root span. We capture that root span's ``(trace_id, span_id)`` and
+    return them; the driver then opens an ``evaluation_context`` span as a
+    *child* of that returned span (same trace), stamping ground truth on it.
+
+    To capture the id of the span the agent authors, we open one enclosing root
+    span (``agent_invocation``) and run the agent inside it. In this model that
+    enclosing span **is** the agent's own root -- a real hosted/BYO agent would
+    emit this itself, so returning it is faithful to "get the span back from the
+    agent."
+    """
+    assert _tracer is not None and _agent is not None, "service not initialized"
+
+    with _tracer.start_as_current_span(AGENT_INVOCATION_SPAN_NAME) as span:
+        result = await _agent.run(req.query)
+        response_text = str(result)
+
+        ctx = span.get_span_context()
+        logger.info(
+            "standalone agent span (trace=%032x span=%016x) for item=%s",
+            ctx.trace_id,
+            ctx.span_id,
+            req.item_id,
+        )
+
+        return StandaloneResponse(
+            item_id=req.item_id,
+            response=response_text,
+            agent_trace_id=f"{ctx.trace_id:032x}",
+            agent_span_id=f"{ctx.span_id:016x}",
         )

@@ -43,6 +43,11 @@ EVALUATION_CONTEXT_SPAN_NAME = "evaluation_context"
 # standing in for a hosted agent runtime's own instrumentation (ACA-faithful).
 EXECUTE_AGENT_SPAN_NAME = "execute_agent"
 
+# --- attach-after (BYO) model ---------------------------------------------
+# The span the agent authors on its own when invoked as a black box (no
+# incoming traceparent). Its (trace_id, span_id) is returned to the driver.
+AGENT_INVOCATION_SPAN_NAME = "agent_invocation"
+
 # Custom span attribute carrying the ground-truth object (JSON string).
 GROUND_TRUTH_ATTRIBUTE = "gen_ai.evaluation.ground_truth"
 
