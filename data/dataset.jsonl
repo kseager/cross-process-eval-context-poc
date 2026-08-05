@@ -1,4 +1,5 @@
-{"id": "1", "query": "What is the capital of France?", "ground_truth": {"answer": "Paris", "reasoning": "France's capital and largest city is Paris.", "sources": ["https://en.wikipedia.org/wiki/Paris"], "labels": ["geography", "easy"]}}
-{"id": "2", "query": "What is 2 + 2?", "ground_truth": {"answer": "4", "reasoning": "Basic arithmetic: 2 + 2 = 4.", "sources": [], "labels": ["math", "easy"]}}
-{"id": "3", "query": "Who wrote Romeo and Juliet?", "ground_truth": {"answer": "William Shakespeare", "reasoning": "Romeo and Juliet is a tragedy written by William Shakespeare.", "sources": ["https://en.wikipedia.org/wiki/Romeo_and_Juliet"], "labels": ["literature", "easy"]}}
-
+{"id": "q1", "query": "What is the capital of France?", "ground_truth": "Paris"}
+{"id": "q2", "query": "Who wrote the play Romeo and Juliet?", "ground_truth": "William Shakespeare"}
+{"id": "q3", "query": "What is the chemical symbol for gold?", "ground_truth": "Au"}
+{"id": "q4", "query": "How many continents are there on Earth?", "ground_truth": "Seven"}
+{"id": "q5", "query": "What planet is known as the Red Planet?", "ground_truth": "Mars"}
