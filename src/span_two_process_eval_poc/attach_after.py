@@ -1,40 +1,29 @@
-"""Attach-after driver -- the **BYO / "attach a span to the agent's trace"** POC.
+"""Driver that attaches an evaluation span to an agent's own trace.
 
-This is an alternative to :mod:`eval_worker` that inverts the control flow.
+The agent runs first, as a complete black box, with **no** incoming
+``traceparent``. It authors its own ``invoke_agent`` span and returns that span's
+``(trace_id, span_id)``. The driver then opens an ``evaluation_context`` span as
+a **child** of the returned span -- same trace, ``operation_ParentId`` == the
+agent's span -- and stamps ground truth on it.
 
-**eval_worker (wrap-around):** the driver authors the parent
-``evaluation_context`` span *first*, injects a ``traceparent`` header, and the
-agent must run *inside* that context. The agent has to accept and honor an
-incoming ``traceparent`` (and we bypass ``AgentTelemetryLayer`` to avoid a
-double span).
-
-**attach_after (this module):** the agent runs *first*, as a complete black box,
-with **no** incoming ``traceparent``. It authors its own root span and returns
-that span's ``(trace_id, span_id)``. The driver then opens an
-``evaluation_context`` span as a **child** of the returned span -- same trace,
-``operation_ParentId`` == the agent's span -- and stamps ground truth on it.
-
-Why this matters for BYO agents (Ankit's idea):
+Properties:
 
 * **Zero request-path coupling.** The agent needs no ``traceparent`` handling,
   no context propagation, no ``RawAgent`` bypass. Any agent that can report the
   OTel span context it emitted works.
-* **No manufactured outer span.** The agent's real root span stays the root; we
-  do not fabricate a parent above it. This answers the objection that a real
-  Foundry agent never emits an "uber outer span".
-* Ground truth becomes a child *annotation* of the real agent run, in the same
-  trace -- semantically "metadata about this run", not a wrapper around it.
+* **No manufactured outer span.** The agent's real ``invoke_agent`` span stays
+  the root; no parent is fabricated above it.
+* Ground truth is a child *annotation* of the real agent run, in the same trace.
 
 Resulting span tree (one trace)::
 
-    agent_invocation                   (agent-service, authored by the agent)
+    invoke_agent <name>                (agent-service, framework's own span)
     │  └─ chat ...                      (agent framework)
-    └─ evaluation_context              (driver, ATTACHED AFTER via returned ids)
+    └─ evaluation_context              (driver, attached via returned ids)
           • attribute: gen_ai.evaluation.ground_truth = {...}
 
-Note: this changes only the *authoring* topology. Whether the eval service reads
-ground truth off this attached child span is the same open consumption gap the
-wrap-around model has -- attaching after does not, by itself, close it.
+This changes only the *authoring* topology; whether the eval service reads ground
+truth off this attached child span is a separate consumption concern.
 """
 
 from __future__ import annotations
@@ -74,7 +63,7 @@ _SAMPLED_FLAGS = 0x01
 
 
 async def run(dataset_path: Path, agent_service_url: str) -> list[dict[str, str]]:
-    """Drive the attach-after loop.
+    """Drive the evaluation loop.
 
     For each row: invoke the agent as a black box, receive the span ids it
     authored, then attach an ``evaluation_context`` child span carrying ground
@@ -116,9 +105,8 @@ async def run(dataset_path: Path, agent_service_url: str) -> list[dict[str, str]
             print(f"  ground_truth   : {item.ground_truth}")
 
             # 2. Reconstruct the agent's span as a REMOTE PARENT from the ids it
-            #    returned, then open evaluation_context as its child. This is the
-            #    whole idea: attach a span to the agent's existing trace after the
-            #    fact, using nothing but the returned (trace_id, span_id).
+            #    returned, then open evaluation_context as its child, using
+            #    nothing but the returned (trace_id, span_id).
             traceparent = build_traceparent(
                 int(agent_trace_id, 16), int(agent_span_id, 16), _SAMPLED_FLAGS
             )
@@ -162,7 +150,7 @@ async def run(dataset_path: Path, agent_service_url: str) -> list[dict[str, str]
 
 
 def cli() -> None:
-    """Parse arguments, load config, and run the attach-after driver."""
+    """Parse arguments, load config, and run the driver."""
     load_dotenv()
 
     parser = argparse.ArgumentParser(description=__doc__)
