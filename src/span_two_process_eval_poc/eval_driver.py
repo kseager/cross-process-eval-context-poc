@@ -1,6 +1,6 @@
 """Driver that attaches an evaluation span to an agent's own trace.
 
-The agent runs first, as a complete black box, with **no** incoming
+The agent runs first, as a complete black box, with no incoming
 ``traceparent``. It authors its own ``invoke_agent`` span and returns that span's
 ``(trace_id, span_id)``. The driver then opens an ``evaluation_context`` span as
 a **child** of the returned span -- same trace, ``operation_ParentId`` == the
@@ -8,12 +8,12 @@ agent's span -- and stamps ground truth on it.
 
 Properties:
 
-* **Zero request-path coupling.** The agent needs no ``traceparent`` handling,
-  no context propagation, no ``RawAgent`` bypass. Any agent that can report the
-  OTel span context it emitted works.
-* **No manufactured outer span.** The agent's real ``invoke_agent`` span stays
-  the root; no parent is fabricated above it.
-* Ground truth is a child *annotation* of the real agent run, in the same trace.
+* **Zero request-path coupling.** The agent needs no ``traceparent`` handling or
+  context propagation. Any agent that reports back the ``(trace_id, span_id)``
+  of the span it emitted works.
+* **No manufactured outer span.** The agent's ``invoke_agent`` span stays the
+  root; no parent is fabricated above it.
+* Ground truth is a child *annotation* of the agent run, in the same trace.
 
 Resulting span tree (one trace)::
 
@@ -22,8 +22,9 @@ Resulting span tree (one trace)::
     └─ evaluation_context              (driver, attached via returned ids)
           • attribute: gen_ai.evaluation.ground_truth = {...}
 
-This changes only the *authoring* topology; whether the eval service reads ground
-truth off this attached child span is a separate consumption concern.
+The driver only attaches ground truth to the trace; whether an eval service
+later reads that ground truth off the attached child span is a separate
+consumption concern (see the optional ``--evaluate`` post-processing step).
 """
 
 from __future__ import annotations

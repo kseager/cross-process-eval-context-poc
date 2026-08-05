@@ -1,10 +1,8 @@
-"""Agent construction (unchanged from a normal Agent Framework app).
+"""Agent construction (a normal Agent Framework app).
 
-This is deliberately identical to an ordinary Foundry-backed agent: the whole
-point of the POC is that the *agent* process needs **no** special code for
-span-exact evaluation correlation. The runner owns the ``evaluation_context``
-span and
-injects trace context; the agent just runs.
+The agent process needs no special code for evaluation correlation: it is an
+ordinary Foundry-backed agent that just runs. Its own ``invoke_agent`` span,
+authored by Agent Framework, is what the evaluation driver attaches to.
 """
 
 from __future__ import annotations

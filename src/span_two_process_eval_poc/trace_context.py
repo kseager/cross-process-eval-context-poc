@@ -72,10 +72,9 @@ def parent_context_from_traceparent(traceparent: str) -> Context:
     """Rebuild a *remote* parent :class:`Context` from a ``traceparent``.
 
     Uses OpenTelemetry's ``TraceContextTextMapPropagator.extract`` -- the
-    idiomatic W3C parser (the same mechanism ACA's ``trace_utils`` uses) -- so
-    all Trace Context edge cases are handled. Starting a new span with the
-    returned context as parent makes the new span a child of exactly the span
-    the ``traceparent`` came from.
+    idiomatic W3C parser -- so all Trace Context edge cases are handled.
+    Starting a new span with the returned context as parent makes the new span a
+    child of exactly the span the ``traceparent`` came from.
 
     Unlike the propagator's default lenient behavior (which yields an *invalid*
     context on a bad header, silently orphaning the child as a new root), this

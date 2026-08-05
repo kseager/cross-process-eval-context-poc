@@ -19,12 +19,12 @@ POC exists to surface:
 1. **No ground truth** -- ``builtin.coherence``. Scores the response using only
    ``query`` + ``response`` pulled from the trace. This is **expected to pass**.
 2. **Requires ground truth** -- ``builtin.f1_score``. Needs a ``ground_truth``
-   input. We stamp ground truth on the driver's ``invoke_agent`` span as the
-   custom attribute ``gen_ai.evaluation.ground_truth`` on the driver's
-   ``evaluation_context`` span, but the ``azure_ai_traces``
-   sample schema only exposes ``sample.query`` / ``sample.response`` /
-   ``sample.tool_definitions`` -- it does **not** surface our custom attribute.
-   So this criterion has no ``ground_truth`` to read and is **expected to fail**.
+   input. Ground truth is stamped as the custom attribute
+   ``gen_ai.evaluation.ground_truth`` on the driver-authored
+   ``evaluation_context`` span, but the ``azure_ai_traces`` sample schema only
+   exposes ``sample.query`` / ``sample.response`` / ``sample.tool_definitions``
+   -- it does **not** surface that custom attribute. So this criterion has no
+   ``ground_truth`` to read and is **expected to fail**.
 
    That failure is the whole point: it proves that today the eval service cannot
    consume ground truth stamped as a trace attribute. Making the GT attribute

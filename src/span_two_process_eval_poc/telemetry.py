@@ -4,12 +4,11 @@ Configures OpenTelemetry to export traces (and metrics/logs) to Azure Monitor /
 Application Insights, and turns on Agent Framework instrumentation so that agent
 invocations, chat calls, and tool calls are automatically traced.
 
-Both processes (the eval-worker driver and the agent-service) call
+Both the evaluation driver and the agent-service call
 :func:`setup_observability` so their spans land in the same App Insights
 resource and share one trace. Each process sets ``OTEL_SERVICE_NAME`` before
 calling it, so ``create_resource`` tags their spans with distinct
-``cloud_RoleName`` values (``evaluation_context`` vs ``execute_agent`` stay
-attributable to their respective roles).
+``cloud_RoleName`` values, keeping each process attributable to its role.
 """
 
 from __future__ import annotations

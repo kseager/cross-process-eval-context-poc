@@ -1,19 +1,32 @@
 """Agent service -- a **separate process** that hosts the agent over HTTP.
 
 The agent runs as a pure **black box**: this service invokes it natively with
-**no** incoming tracing context, so Agent Framework's own ``AgentTelemetryLayer``
-emits the agent's natural ``invoke_agent <name>`` span. A passive
-``SpanProcessor`` captures that span's ``(trace_id, span_id)`` and the
-``/invoke-standalone`` endpoint returns them, so the driver can attach an
-``evaluation_context`` child span to the agent's real trace **afterward**::
+no incoming tracing context, so Agent Framework's ``AgentTelemetryLayer`` emits
+the agent's ``invoke_agent <name>`` span. A ``SpanProcessor`` captures that
+span's ``(trace_id, span_id)`` and the ``/invoke-standalone`` endpoint returns
+them, so a separate evaluation process can attach an ``evaluation_context``
+child span to the agent's trace afterward::
 
     [invoke_agent <name>]   (agent, authored natively)
     ↳ [chat ...]            (agent framework)
-    ↳ [evaluation_context]  (driver, attached cross-process via returned ids)
+    ↳ [evaluation_context]  (evaluation driver, attached via returned ids)
 
-The agent business logic needs **zero** tracing code, and this service does not
-wrap the run in a span of its own -- the agent's real ``invoke_agent`` span *is*
-the attach target.
+------------------------------------------------------------------------------
+CONTRACT WITH THE EVALUATION DRIVER (the required integration point)
+------------------------------------------------------------------------------
+The evaluation driver can only attach ground truth to the agent's trace if the
+agent invocation returns the identity of the span the agent authored. Every
+successful ``/invoke-standalone`` response therefore MUST include:
+
+    * ``agent_trace_id`` -- the 128-bit trace id as 32 lowercase hex chars.
+    * ``agent_span_id``  -- the 64-bit span id  as 16 lowercase hex chars.
+
+These two ids ARE the contract. They must identify the exact span the driver
+should parent ``evaluation_context`` to (here, the agent's ``invoke_agent``
+span), and they must belong to a trace that was actually exported to the same
+App Insights the driver queries. Any agent host that returns these two ids for
+an invocation can plug into the evaluation driver; how the host obtains them is
+its own concern. The agent business logic itself needs no tracing code.
 """
 
 from __future__ import annotations
@@ -36,11 +49,10 @@ from .telemetry import setup_observability
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("agent-service")
 
-# Per-request holder for the id of the framework's own invoke_agent span. The
-# standalone flow runs the agent natively, so Agent Framework's
-# AgentTelemetryLayer emits an "invoke_agent <name>" span. We capture THAT span
-# (the agent's real root) so the driver can attach evaluation_context directly to
-# it -- no redundant wrapper span of our own.
+# Per-request holder for the id of the agent's invoke_agent span. The agent runs
+# natively, so Agent Framework's AgentTelemetryLayer emits an "invoke_agent
+# <name>" span. We capture THAT span (the agent's root) and return its ids so the
+# evaluation driver can attach its own span as a child of it.
 _invoke_agent_ctx: contextvars.ContextVar[tuple[int, int] | None] = (
     contextvars.ContextVar("_invoke_agent_ctx", default=None)
 )
@@ -78,7 +90,7 @@ _agent = None
 
 
 class InvokeRequest(BaseModel):
-    """Payload the runner sends to invoke the agent."""
+    """Payload the caller sends to invoke the agent."""
 
     item_id: str
     query: str
@@ -102,11 +114,11 @@ def _startup() -> None:
 
 
 class StandaloneResponse(BaseModel):
-    """Agent answer plus the ids of the span the agent authored on its own.
+    """Agent answer plus the ids of the span the agent authored.
 
-    The agent runs with **no** incoming ``traceparent``: it authors its own
-    ``invoke_agent`` span and reports that span's identity back so the driver can
-    attach an ``evaluation_context`` child span to it afterward.
+    ``agent_trace_id`` / ``agent_span_id`` are the contract with the evaluation
+    driver: they identify the ``invoke_agent`` span the driver parents its
+    ``evaluation_context`` span to. Both are lowercase hex (32 / 16 chars).
     """
 
     item_id: str
@@ -119,21 +131,20 @@ class StandaloneResponse(BaseModel):
 async def invoke_standalone(req: InvokeRequest) -> StandaloneResponse:
     """Run the agent as a black box and return the id of the span it authored.
 
-    The request path has **zero** tracing coupling -- no ``traceparent`` header,
-    no context injection, no ``RawAgent`` bypass. The agent runs exactly as it
-    normally would and Agent Framework's own ``AgentTelemetryLayer`` emits its
-    natural ``invoke_agent <name>`` span. We capture **that** span's
-    ``(trace_id, span_id)`` (via ``_InvokeAgentSpanCapture``) and return them; the
-    driver then opens an ``evaluation_context`` span as a *child* of that returned
-    span (same trace), stamping ground truth on it.
+    The agent runs natively with no incoming ``traceparent``, so Agent
+    Framework's ``AgentTelemetryLayer`` emits its ``invoke_agent <name>`` span.
+    ``_InvokeAgentSpanCapture`` records that span's ``(trace_id, span_id)`` and
+    we return them as ``agent_trace_id`` / ``agent_span_id`` so the evaluation
+    driver can open its ``evaluation_context`` span as a child of it (same
+    trace) and stamp ground truth there.
 
-    We deliberately do **not** wrap the run in an extra span of our own -- the
-    agent's real ``invoke_agent`` span *is* the attach target.
+    Returning those two ids is the required contract: without them the driver
+    has no span to attach to.
     """
     assert _tracer is not None and _agent is not None, "service not initialized"
 
     # Reset the per-request capture slot, run the agent natively, then read back
-    # the framework's invoke_agent span id that the processor recorded.
+    # the invoke_agent span id that the processor recorded.
     token = _invoke_agent_ctx.set(None)
     try:
         result = await _agent.run(req.query)
