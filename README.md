@@ -279,19 +279,31 @@ union traces, dependencies, requests, exceptions
 
 ## Notes / trade-offs
 
+- **It does not matter who calls the agent.** This is the whole point of the
+  attach-after model. The agent runs as a pure **black box**: it establishes its
+  own trace natively (`invoke_agent → chat`), knows nothing about evaluation, and
+  needs **zero** tracing code. The *only* contract between the agent and the
+  harness is that the invocation **returns the agent's `trace_id` + `span_id`**.
+  Any process — this driver, a notebook, a CI job, some other service — that
+  receives those two ids can attach the ground-truth span afterward. There is no
+  requirement that the evaluation harness be the caller, and no context has to be
+  set up *before* the agent runs.
+  - Contrast with the wrap-around model (`kaseager/wrap-around-gt-span` branch),
+    where the **caller must** author the parent span and inject a `traceparent`
+    *before* the agent runs, forcing the agent to execute inside a context the
+    caller controls. Attach-after inverts that: the ids flow **outward** from the
+    agent, and attachment happens **after the fact**.
+- **How the ids get back is an implementation detail.** In this POC the
+  `/invoke-standalone` endpoint captures the framework's own `invoke_agent` span
+  and returns `agent_trace_id` / `agent_span_id`. A real BYO agent can surface
+  them however it likes — response body, HTTP header, message field — as long as
+  they are returned.
 - The ground-truth object is set **directly as a JSON attribute**
-  (`gen_ai.evaluation.ground_truth`) on the `invoke_agent` span the driver
-  authors — there is no separate eval/child span. OTel attribute values must be
-  primitives, so the structured object travels as a JSON string.
-- The driver **authors** the `invoke_agent` span; the agent is a **remote
-  service** that opens an `execute_agent` span beneath it via the propagated
-  `traceparent` header. This matches ACA's hierarchy
-  (`invoke_agent → execute_agent → chat`): the driver span carries the ground
-  truth, the `execute_agent` span carries the agent payload. Stamping ground
-  truth on the driver's span is authoritative — the agent needs no tracing code.
+  (`gen_ai.evaluation.ground_truth`) on the driver's span, which is attached as a
+  child of the agent's real `invoke_agent` span (same `trace_id`, cross-process).
+  OTel attribute values must be primitives, so the structured object travels as a
+  JSON string.
 - Evaluation/scoring is **not** performed here — only ground-truth *input* is
   attached. Scoring is a separate **post-processing** step run after all agent
   invocations complete (read the spans back from App Insights and compute
   metrics).
-- If you also want the agent's *internal* spans in the same trace, enable OTel
-  auto-instrumentation on the agent via **config** (still no source changes).
