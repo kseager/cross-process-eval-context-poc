@@ -65,7 +65,7 @@ sequenceDiagram
     participant EW as eval_worker.py<br/>(driver, per item)
     participant TP as W3C traceparent<br/>(HTTP header)
     participant AS as agent_service.py<br/>(remote process)
-    participant AF as Agent Framework<br/>(auto-instrumentation)
+    participant AF as Agent Framework<br/>(chat instrumentation)
     participant AI as App Insights
 
     Note over EW: rows = [id -> DatasetItem]<br/>(ground-truth registry)
@@ -79,17 +79,16 @@ sequenceDiagram
     end
 
     AS->>AS: parent_ctx = parent_context_from_traceparent(header)
-    AS->>AS: otel_context.attach(parent_ctx)
-    AS->>AF: await agent.run(query)
-    AF-->>AF: emits "invoke_agent <agent_name>" span<br/>(nested UNDER driver invoke_agent)
-    AF-->>AF: emits "chat" / tool spans beneath it
-    AS-->>EW: { response, agent_trace_id }
-    EW->>EW: assert agent_trace_id == invoke_agent trace_id
+    Note over AS: with start_as_current_span("execute_agent", context=parent_ctx)
+    AS->>AF: RawAgent.run(agent, query)<br/>(bypasses AgentTelemetryLayer)
+    AF-->>AF: emits "chat" / tool spans<br/>(nested UNDER execute_agent)
+    AS-->>EW: { response, execute_agent_trace_id, execute_agent_span_id }
+    EW->>EW: assert execute_agent_trace_id == invoke_agent trace_id
 
     par export (both processes -> same trace_id)
         EW->>AI: invoke_agent span + ground_truth attribute
     and
-        AF->>AI: invoke_agent <agent_name> + chat spans
+        AS->>AI: execute_agent + chat spans
     end
     Note over AI: post-processing step (later):<br/>read spans back, score vs ground truth
 ```
@@ -100,18 +99,26 @@ Resulting span tree (one `trace_id`):
 invoke_agent                         (eval-worker/driver authors, span_id=A)
 │  • attribute: gen_ai.evaluation.ground_truth = {...}   ← ground truth here
 │  • attribute: gen_ai.evaluation.item_id = "<id>"
-└─ invoke_agent <agent_name>         (agent-service, framework auto-span)
+└─ execute_agent                     (agent-service authors, via traceparent header)
     └─ chat / tool spans             (agent framework)
 ```
 
 The **agent process is never involved in correlation** — the *driver* authors
 the `invoke_agent` span, injects its `traceparent` into the remote agent call,
-and sets the ground truth as an attribute on that same span. The agent is a
-plain Agent Framework app: its own instrumentation emits an
-`invoke_agent <agent_name>` span that nests under the driver's `invoke_agent`.
-This matches ACA (`target_util.invoke_agent_with_tracing`), where nested
-`invoke_agent` spans are expected and reconciled downstream by the trace
-consumer's parent-chain dedup — **no** agent-side tracing code is required.
+and sets the ground truth as an attribute on that same span. The agent-service
+opens an `execute_agent` span (parented to the driver's `invoke_agent` via the
+header) and runs the agent beneath it, so `chat`/tool spans nest under
+`execute_agent`. This matches ACA's hierarchy
+(`invoke_agent → execute_agent → chat`), where the remote hosted-agent runtime
+authors `execute_agent`.
+
+> **Local-agent note.** In ACA, `execute_agent` is emitted by Foundry's *hosted*
+> agent runtime. Because this POC runs the agent **locally**, the agent-service
+> runs it via `RawAgent.run` to bypass Agent Framework's `AgentTelemetryLayer` —
+> otherwise the framework would add its own `invoke_agent <agent_name>` span,
+> which a hosted agent never produces. The agent *code* is unchanged; only *how
+> the service invokes it* differs, yielding the exact tree a hosted-agent
+> customer sees.
 
 > **Evaluation is a separate post-processing step.** The driver only *attaches
 > ground-truth input* to the `invoke_agent` span. Scoring the agent's responses

@@ -29,8 +29,9 @@ from opentelemetry import trace
 from opentelemetry.trace import Tracer
 from pydantic import BaseModel
 
+from agent_framework._agents import RawAgent
+
 from .agent import build_agent
-from opentelemetry import context as otel_context
 
 from .telemetry import setup_observability
 from .trace_context import parent_context_from_traceparent
@@ -39,6 +40,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("agent-service")
 
 SERVICE_NAME = "agent-service"
+EXECUTE_AGENT_SPAN_NAME = "execute_agent"
 
 app = FastAPI(title="agent-service")
 
@@ -54,11 +56,12 @@ class InvokeRequest(BaseModel):
 
 
 class InvokeResponse(BaseModel):
-    """The agent's answer plus the trace it ran under (for correlation)."""
+    """The agent's answer plus the execute_agent span ids (for correlation)."""
 
     item_id: str
     response: str
-    agent_trace_id: str
+    execute_agent_trace_id: str
+    execute_agent_span_id: str
 
 
 @app.on_event("startup")
@@ -77,51 +80,48 @@ async def invoke(
     req: InvokeRequest,
     traceparent: str | None = Header(default=None),
 ) -> InvokeResponse:
-    """Run the agent so its framework ``invoke_agent`` span nests under the driver.
+    """Run the agent under an ``execute_agent`` span parented to invoke_agent.
 
     The driver passes ``traceparent`` (pointing at its ``invoke_agent`` span) as
-    an HTTP header. We attach that rebuilt remote parent as the active context
-    and simply run the agent -- Agent Framework's *own* instrumentation emits
-    the child ``invoke_agent <agent_name>`` span beneath it. This mirrors ACA
-    exactly (``target_util.invoke_agent_with_tracing``): the remote agent is a
-    plain framework app and needs **no** span code of its own; nested
-    ``invoke_agent`` spans are expected and reconciled downstream by the trace
-    consumer's parent-chain dedup.
+    an HTTP header. We rebuild that remote parent and open an ``execute_agent``
+    span beneath it -- matching ACA's hierarchy
+    (``invoke_agent -> execute_agent -> chat``), where the remote hosted-agent
+    runtime authors ``execute_agent``.
+
+    Because our agent runs *locally* (not via Foundry's hosted runtime), we run
+    it through ``RawAgent.run`` to bypass Agent Framework's ``AgentTelemetryLayer``
+    -- otherwise the framework would emit its own ``invoke_agent <agent_name>``
+    span, which a real hosted agent never produces. The chat client still emits
+    its ``chat`` span, so ``chat`` nests directly under our ``execute_agent`` --
+    exactly the tree a hosted-agent customer sees. The agent code itself is
+    unchanged; only *how the service invokes it* differs.
     """
     assert _tracer is not None and _agent is not None, "service not initialized"
 
-    # Rebuild the driver's invoke_agent span as a remote parent from the header
-    # and make it the active context, so the framework's auto agent-span parents
-    # to it. No manual span is created here.
+    # Rebuild the driver's invoke_agent span as a remote parent from the header.
     parent_ctx = parent_context_from_traceparent(traceparent) if traceparent else None
-    token = otel_context.attach(parent_ctx) if parent_ctx is not None else None
-    try:
-        result = await _agent.run(req.query)
-    finally:
-        if token is not None:
-            otel_context.detach(token)
-    response_text = str(result)
 
-    # The framework's invoke_agent <agent_name> span is created *and finished*
-    # inside `_agent.run()`, so its span_id is not observable from here. What we
-    # can report -- and all the driver needs for its correlation check -- is the
-    # trace it ran under, which is the remote parent's (== the driver's
-    # invoke_agent) trace_id.
-    parent_span_ctx = trace.get_current_span(parent_ctx).get_span_context()
-    agent_trace_id = (
-        f"{parent_span_ctx.trace_id:032x}"
-        if parent_span_ctx.is_valid
-        else "0" * 32
-    )
-    logger.info(
-        "framework invoke_agent span ran under traceparent=%s (trace=%s) for item=%s",
-        traceparent,
-        agent_trace_id,
-        req.item_id,
-    )
+    with _tracer.start_as_current_span(
+        EXECUTE_AGENT_SPAN_NAME, context=parent_ctx
+    ) as span:
+        # Bypass AgentTelemetryLayer so no invoke_agent <agent_name> span is
+        # emitted; chat nests directly under execute_agent (ACA-faithful).
+        result = await RawAgent.run(_agent, req.query)
+        response_text = str(result)
 
-    return InvokeResponse(
-        item_id=req.item_id,
-        response=response_text,
-        agent_trace_id=agent_trace_id,
-    )
+        ctx = span.get_span_context()
+        logger.info(
+            "execute_agent span (trace=%032x span=%016x) parented to "
+            "traceparent=%s for item=%s",
+            ctx.trace_id,
+            ctx.span_id,
+            traceparent,
+            req.item_id,
+        )
+
+        return InvokeResponse(
+            item_id=req.item_id,
+            response=response_text,
+            execute_agent_trace_id=f"{ctx.trace_id:032x}",
+            execute_agent_span_id=f"{ctx.span_id:016x}",
+        )

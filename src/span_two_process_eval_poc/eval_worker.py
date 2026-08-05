@@ -5,11 +5,10 @@ This process owns the execution loop. For every dataset row it:
 1. **Authors** an ``invoke_agent`` span and builds a W3C ``traceparent`` that
    points at it.
 2. **Invokes the agent** -- a *separate* HTTP service (``AGENT_SERVICE_URL``) --
-   passing the ``traceparent`` as a request header. The agent is a plain Agent
-   Framework app: its own instrumentation emits an ``invoke_agent <agent_name>``
-   span *under* this driver-authored ``invoke_agent`` span. The agent process
-   needs no tracing code; it is a passive header recipient. (This mirrors ACA:
-   nested ``invoke_agent`` spans are expected and reconciled downstream.)
+   passing the ``traceparent`` as a request header so the agent-service opens an
+   ``execute_agent`` span *under* this ``invoke_agent`` span (matching ACA's
+   ``invoke_agent -> execute_agent -> chat`` hierarchy). The agent *code* needs
+   no tracing changes; the service just runs it beneath ``execute_agent``.
 3. Sets the **ground-truth object** directly as an **attribute on the
    ``invoke_agent`` span** it created (no separate child span).
 
@@ -17,7 +16,7 @@ Resulting span tree (one trace)::
 
     invoke_agent                       (this process, span_id=A)
     │  • attribute: gen_ai.evaluation.ground_truth = {...}
-    └─ invoke_agent <agent_name>       (agent-service framework auto-span)
+    └─ execute_agent                   (agent-service, via traceparent header)
         └─ chat ...                    (agent framework)
 
 The eval-worker only *attaches ground-truth input*. Actual evaluation (scoring
@@ -81,9 +80,8 @@ async def run(dataset_path: Path, agent_service_url: str) -> list[dict[str, str]
             print(f"\n[{item.id}]")
             print(f"  query        : {item.query}")
 
-            # Author the invoke_agent span; the agent is a remote framework app
-            # whose own instrumentation emits invoke_agent <agent_name> beneath
-            # it (nested invoke_agent, ACA-style).
+            # Author the invoke_agent span; the agent-service opens execute_agent
+            # (ACA-style) beneath it via the traceparent header.
             with tracer.start_as_current_span("invoke_agent") as span:
                 span_ctx = span.get_span_context()
                 operation_id = f"{span_ctx.trace_id:032x}"
@@ -106,8 +104,7 @@ async def run(dataset_path: Path, agent_service_url: str) -> list[dict[str, str]
                 span.set_attribute(GROUND_TRUTH_ATTRIBUTE, ground_truth_json)
 
                 # Invoke the REMOTE agent, injecting the traceparent as a header
-                # so the framework's invoke_agent <agent_name> span nests under
-                # this driver-authored invoke_agent span.
+                # so its execute_agent span nests under this invoke_agent span.
                 try:
                     agent_resp = await client.post(
                         agent_service_url,
@@ -137,20 +134,23 @@ async def run(dataset_path: Path, agent_service_url: str) -> list[dict[str, str]
             print(f"  response     : {response_text}")
             print(f"  ground_truth : {item.ground_truth}")
             print(
-                "  agent span   : framework invoke_agent "
-                f"(child of driver invoke_agent, trace={agent_result['agent_trace_id']})"
+                f"  execute_agent: span_id={agent_result['execute_agent_span_id']} "
+                f"(child of invoke_agent)"
             )
 
-            # Sanity check: the framework's agent span must share this trace.
+            # Sanity check: the agent's execute_agent span must correlate to
+            # this invoke_agent span (same trace).
             assert (
-                agent_result["agent_trace_id"] == f"{span_ctx.trace_id:032x}"
-            ), "framework agent span is not in the same trace as invoke_agent"
+                agent_result["execute_agent_trace_id"]
+                == f"{span_ctx.trace_id:032x}"
+            ), "execute_agent is not in the same trace as invoke_agent"
 
             results.append(
                 {
                     "item_id": item.id,
                     "operation_id": operation_id,
                     "invoke_agent_span_id": f"{span_ctx.span_id:016x}",
+                    "execute_agent_span_id": agent_result["execute_agent_span_id"],
                     "status": "OK",
                 }
             )
@@ -180,8 +180,7 @@ def cli() -> None:
     results = asyncio.run(run(args.dataset, args.agent_service_url))
 
     print(
-        "\nDone. invoke_agent (with ground_truth attribute) + framework "
-        "invoke_agent <agent_name> "
+        "\nDone. invoke_agent (with ground_truth attribute) + execute_agent "
         "exported to App Insights. Evaluation itself is a separate "
         "post-processing step."
     )
