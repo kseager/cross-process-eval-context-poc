@@ -6,3 +6,6 @@ dist/
 build/
 *.egg-info/
 .pytest_cache/
+
+# local run logs
+agentsvc.*.log

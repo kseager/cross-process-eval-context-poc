@@ -37,6 +37,7 @@ from typing import Any
 
 import httpx
 from opentelemetry import trace
+from opentelemetry.trace import Status, StatusCode
 from dotenv import load_dotenv
 
 from .dataset import load_dataset
@@ -56,7 +57,7 @@ DEFAULT_DATASET = (
 DEFAULT_AGENT_SERVICE_URL = "http://localhost:8002/invoke"
 
 
-async def run(dataset_path: Path, agent_service_url: str) -> None:
+async def run(dataset_path: Path, agent_service_url: str) -> list[dict[str, str]]:
     """Drive the loop: author invoke_agent, call the agent, stamp ground truth.
 
     The ground-truth object is set as an attribute directly on the
@@ -68,7 +69,12 @@ async def run(dataset_path: Path, agent_service_url: str) -> None:
 
     rows = list(load_dataset(dataset_path))
 
-    async with httpx.AsyncClient(timeout=60.0) as client:
+    # Collected for an App Insights lookup summary at the end. operation_Id in
+    # App Insights == the OTel trace_id (hex), so this is what you paste into a
+    # Transaction search / KQL query to find each run's invoke_agent span.
+    results: list[dict[str, str]] = []
+
+    async with httpx.AsyncClient(timeout=120.0) as client:
         for item in rows:
             print(f"\n[{item.id}]")
             print(f"  query        : {item.query}")
@@ -77,32 +83,53 @@ async def run(dataset_path: Path, agent_service_url: str) -> None:
             # emits execute_agent (not invoke_agent) beneath it.
             with tracer.start_as_current_span("invoke_agent") as span:
                 span_ctx = span.get_span_context()
+                operation_id = f"{span_ctx.trace_id:032x}"
                 invoke_agent_traceparent = traceparent_for_span(span)
                 print(
-                    f"  invoke_agent : trace_id={span_ctx.trace_id:032x} "
+                    f"  invoke_agent : trace_id={operation_id} "
                     f"span_id={span_ctx.span_id:016x}"
                 )
-
-                # Invoke the REMOTE agent, injecting the traceparent as a header
-                # so its execute_agent span nests under this invoke_agent span.
-                agent_resp = await client.post(
-                    agent_service_url,
-                    json={"item_id": item.id, "query": item.query},
-                    headers={"traceparent": invoke_agent_traceparent},
-                )
-                agent_resp.raise_for_status()
-                agent_result = agent_resp.json()
-                response_text = agent_result["response"]
+                print(f"  operation_Id : {operation_id}  (App Insights)")
 
                 # Attach the ground-truth object DIRECTLY on the invoke_agent
                 # span. OTel attribute values must be primitives, so structured
-                # objects travel as a JSON string. Ground truth only -- no score.
+                # objects travel as a JSON string. Ground truth is driver-owned
+                # input, so it is stamped regardless of whether the agent call
+                # succeeds. Ground truth only -- no score.
                 ground_truth_json = json.dumps(
                     item.ground_truth, ensure_ascii=False
                 )
                 span.set_attribute("gen_ai.evaluation.item_id", item.id)
                 span.set_attribute(GROUND_TRUTH_ATTRIBUTE, ground_truth_json)
 
+                # Invoke the REMOTE agent, injecting the traceparent as a header
+                # so its execute_agent span nests under this invoke_agent span.
+                try:
+                    agent_resp = await client.post(
+                        agent_service_url,
+                        json={"item_id": item.id, "query": item.query},
+                        headers={"traceparent": invoke_agent_traceparent},
+                    )
+                    agent_resp.raise_for_status()
+                    agent_result = agent_resp.json()
+                except httpx.HTTPError as exc:
+                    # Don't abort the whole run on one transient failure; record
+                    # the error on the span and move to the next item.
+                    span.record_exception(exc)
+                    span.set_status(Status(StatusCode.ERROR, str(exc)))
+                    logger.warning("agent call failed for %s: %s", item.id, exc)
+                    print(f"  ERROR        : {exc}")
+                    results.append(
+                        {
+                            "item_id": item.id,
+                            "operation_id": operation_id,
+                            "invoke_agent_span_id": f"{span_ctx.span_id:016x}",
+                            "status": "ERROR",
+                        }
+                    )
+                    continue
+
+                response_text = agent_result["response"]
             print(f"  response     : {response_text}")
             print(f"  ground_truth : {item.ground_truth}")
             print(
@@ -116,6 +143,18 @@ async def run(dataset_path: Path, agent_service_url: str) -> None:
                 agent_result["execute_agent_trace_id"]
                 == f"{span_ctx.trace_id:032x}"
             ), "execute_agent is not in the same trace as invoke_agent"
+
+            results.append(
+                {
+                    "item_id": item.id,
+                    "operation_id": operation_id,
+                    "invoke_agent_span_id": f"{span_ctx.span_id:016x}",
+                    "execute_agent_span_id": agent_result["execute_agent_span_id"],
+                    "status": "OK",
+                }
+            )
+
+    return results
 
 
 def cli() -> None:
@@ -137,12 +176,32 @@ def cli() -> None:
     )
     args = parser.parse_args()
 
-    asyncio.run(run(args.dataset, args.agent_service_url))
+    results = asyncio.run(run(args.dataset, args.agent_service_url))
+
     print(
         "\nDone. invoke_agent (with ground_truth attribute) + execute_agent "
         "exported to App Insights. Evaluation itself is a separate "
         "post-processing step."
     )
+
+    # App Insights lookup summary. operation_Id == the OTel trace_id.
+    print("\n=== App Insights operation_Id per item ===")
+    print(f"{'item_id':<10} {'status':<7} operation_Id")
+    op_ids = []
+    for r in results:
+        print(f"{r['item_id']:<10} {r['status']:<7} {r['operation_id']}")
+        op_ids.append(r["operation_id"])
+
+    if op_ids:
+        joined = ", ".join(f'"{o}"' for o in op_ids)
+        print(
+            "\nPaste into App Insights Logs (KQL) to see every span from this run:\n"
+            f"union traces, dependencies, requests, exceptions\n"
+            f"| where operation_Id in ({joined})\n"
+            "| project timestamp, itemType, name, operation_Id, operation_ParentId, "
+            'ground_truth = tostring(customDimensions["gen_ai.evaluation.ground_truth"])\n'
+            "| order by timestamp asc"
+        )
 
 
 if __name__ == "__main__":
