@@ -168,6 +168,16 @@ def cli() -> None:
         ),
         help="URL of the agent-service /invoke-standalone endpoint.",
     )
+    parser.add_argument(
+        "--evaluate",
+        action="store_true",
+        default=os.environ.get("RUN_EVALUATION") == "1",
+        help=(
+            "After attaching ground truth, run the trace-id evaluation "
+            "post-processing step (builtin.coherence + builtin.f1_score) over "
+            "the run's traces. Off by default; also enabled via RUN_EVALUATION=1."
+        ),
+    )
     args = parser.parse_args()
 
     results = asyncio.run(run(args.dataset, args.agent_service_url))
@@ -195,6 +205,24 @@ def cli() -> None:
             'ground_truth = tostring(customDimensions["gen_ai.evaluation.ground_truth"])\n'
             "| order by timestamp asc"
         )
+
+    if not args.evaluate:
+        print(
+            "\nEvaluation step skipped (pass --evaluate or set RUN_EVALUATION=1 "
+            "to enable)."
+        )
+        return
+
+    if not op_ids:
+        print("\nNo successful traces to evaluate; skipping evaluation step.")
+        return
+
+    # Import lazily so the azure eval SDK is only required when --evaluate is set.
+    from .evaluation import check_evaluation_results, evaluate_traces
+
+    print(f"\n=== Running trace-id evaluation over {len(op_ids)} trace(s) ===")
+    summary = evaluate_traces(op_ids)
+    check_evaluation_results(summary)
 
 
 if __name__ == "__main__":
