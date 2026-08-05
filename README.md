@@ -293,11 +293,27 @@ union traces, dependencies, requests, exceptions
     *before* the agent runs, forcing the agent to execute inside a context the
     caller controls. Attach-after inverts that: the ids flow **outward** from the
     agent, and attachment happens **after the fact**.
-- **How the ids get back is an implementation detail.** In this POC the
-  `/invoke-standalone` endpoint captures the framework's own `invoke_agent` span
-  and returns `agent_trace_id` / `agent_span_id`. A real BYO agent can surface
-  them however it likes — response body, HTTP header, message field — as long as
-  they are returned.
+- **The agent code is not changed — the _host_ surfaces the ids.** This is the
+  distinction that matters. The agent (`build_agent()`) is invoked as a plain
+  black box (`await _agent.run(query)`): no tracing calls, no returning ids,
+  nothing added to it. The logic that learns the agent's `invoke_agent` span id
+  lives entirely in the **host** (`agent_service.py`), not the agent:
+  - `_InvokeAgentSpanCapture` is an OTel `SpanProcessor` registered on the
+    tracer provider via `provider.add_span_processor(...)`. Its `on_start` hook
+    fires for **every** span the moment it is created — including the framework's
+    internal `invoke_agent` span, which the endpoint code never gets a handle to
+    otherwise (it is created, entered, and ended inside `AgentTelemetryLayer`).
+    We stash that span's `(trace_id, span_id)` in a per-request `ContextVar` and
+    return it after `_agent.run()` completes.
+  - So the boundary is: **agent code = zero changes; host code = one small,
+    passive hook.** The processor never touches the agent object or its code
+    path — it only observes spans at the SDK level.
+  - In this POC the agent and host share one in-process tracer provider, so the
+    SpanProcessor trick works. For a real **out-of-process** BYO agent, the
+    equivalent is the agent's *runtime/host* returning the ids in the response
+    (body, HTTP header, message field). Either way the requirement lands on the
+    **host/runtime**, never on the agent author's logic. The `SpanProcessor` here
+    is simply the in-process stand-in for "the host returns the span ids."
 - The ground-truth object is set **directly as a JSON attribute**
   (`gen_ai.evaluation.ground_truth`) on the driver's span, which is attached as a
   child of the agent's real `invoke_agent` span (same `trace_id`, cross-process).
