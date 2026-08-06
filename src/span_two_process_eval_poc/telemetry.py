@@ -48,6 +48,20 @@ def setup_observability() -> None:
         resource=create_resource(),
     )
 
+    # `configure_azure_monitor` installs a real LoggerProvider (logs pipeline)
+    # but does NOT install an EventLoggerProvider. Without one,
+    # `get_event_logger(...)` resolves to a no-op ProxyEventLogger and
+    # `emit(Event(...))` silently drops the record -- so evaluation events
+    # (ground truth) never reach App Insights. Bind an EventLoggerProvider onto
+    # the LoggerProvider that Azure Monitor just configured so emitted events are
+    # exported as log records (App Insights `traces`), correlated to the stamped
+    # (trace_id, span_id).
+    from opentelemetry._events import set_event_logger_provider
+    from opentelemetry._logs import get_logger_provider
+    from opentelemetry.sdk._events import EventLoggerProvider
+
+    set_event_logger_provider(EventLoggerProvider(get_logger_provider()))
+
     # Agent Framework instrumentation is on by default once OTel providers exist,
     # but sensitive data (prompts/responses) must be explicitly enabled.
     if _truthy(os.environ.get("ENABLE_SENSITIVE_DATA")):

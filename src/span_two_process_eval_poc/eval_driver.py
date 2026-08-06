@@ -39,14 +39,12 @@ from pathlib import Path
 import httpx
 from dotenv import load_dotenv
 from opentelemetry import trace
+from opentelemetry._events import Event, get_event_logger
 
 from .dataset import load_dataset
 from .telemetry import setup_observability
 from .trace_context import (
-    EVALUATION_CONTEXT_SPAN_NAME,
     GROUND_TRUTH_ATTRIBUTE,
-    build_traceparent,
-    parent_context_from_traceparent,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -67,12 +65,15 @@ async def run(dataset_path: Path, agent_service_url: str) -> list[dict[str, str]
     """Drive the evaluation loop.
 
     For each row: invoke the agent as a black box, receive the span ids it
-    authored, then attach an ``evaluation_context`` child span carrying ground
-    truth to that returned span.
+    authored, then emit a ``gen_ai.evaluation.result`` OTel event stamped with
+    that span's ``(trace_id, span_id)``, carrying ground truth. The event is a
+    log record correlated to the agent's ``invoke_agent`` span
+    (``operation_ParentId`` == the agent span id) in the same trace -- no child
+    span, no span mutation.
     """
     os.environ.setdefault("OTEL_SERVICE_NAME", SERVICE_NAME)
     setup_observability()
-    tracer = trace.get_tracer(SERVICE_NAME)
+    event_logger = get_event_logger(SERVICE_NAME)
 
     rows = list(load_dataset(dataset_path))
     results: list[dict[str, str]] = []
@@ -105,36 +106,35 @@ async def run(dataset_path: Path, agent_service_url: str) -> list[dict[str, str]
             print(f"  response       : {response_text}")
             print(f"  ground_truth   : {item.ground_truth}")
 
-            # 2. Reconstruct the agent's span as a REMOTE PARENT from the ids it
-            #    returned, then open evaluation_context as its child, using
-            #    nothing but the returned (trace_id, span_id).
-            traceparent = build_traceparent(
-                int(agent_trace_id, 16), int(agent_span_id, 16), _SAMPLED_FLAGS
+            # 2. Emit a gen_ai.evaluation.result EVENT stamped with the agent's
+            #    (trace_id, span_id). This is a log record correlated to the
+            #    agent's own invoke_agent span (operation_ParentId == agent span
+            #    id) in the SAME trace -- no child span is created and the
+            #    already-ended agent span is not mutated.
+            operation_id = agent_trace_id
+
+            ground_truth_json = json.dumps(item.ground_truth, ensure_ascii=False)
+            evaluation_event = Event(
+                name="gen_ai.evaluation.result",
+                attributes={
+                    "gen_ai.evaluation.item_id": item.id,
+                    GROUND_TRUTH_ATTRIBUTE: ground_truth_json,
+                },
+                trace_id=int(agent_trace_id, 16),
+                span_id=int(agent_span_id, 16),
+                trace_flags=trace.TraceFlags(_SAMPLED_FLAGS),
             )
-            parent_ctx = parent_context_from_traceparent(traceparent)
+            event_logger.emit(evaluation_event)
 
-            with tracer.start_as_current_span(
-                EVALUATION_CONTEXT_SPAN_NAME, context=parent_ctx
-            ) as span:
-                span_ctx = span.get_span_context()
-                # operation_Id in App Insights == the trace_id. Because we
-                # attached inside the agent's trace, this equals the agent's
-                # trace_id -- the GT span lives in the SAME trace as the agent.
-                operation_id = f"{span_ctx.trace_id:032x}"
+            print(
+                f"  eval_event     : name=gen_ai.evaluation.result "
+                f"trace_id={operation_id} "
+                f"(parent=agent span {agent_span_id})"
+            )
 
-                ground_truth_json = json.dumps(item.ground_truth, ensure_ascii=False)
-                span.set_attribute("gen_ai.evaluation.item_id", item.id)
-                span.set_attribute(GROUND_TRUTH_ATTRIBUTE, ground_truth_json)
-
-                print(
-                    f"  eval_context   : trace_id={operation_id} "
-                    f"span_id={span_ctx.span_id:016x} "
-                    f"(child of agent span {agent_span_id})"
-                )
-
-            # Sanity: the attached span must share the agent's trace.
+            # Sanity: the event must be stamped into the agent's trace.
             assert operation_id == agent_trace_id, (
-                "evaluation_context is not in the same trace as the agent span"
+                "evaluation event is not stamped into the agent's trace"
             )
 
             results.append(
@@ -142,7 +142,7 @@ async def run(dataset_path: Path, agent_service_url: str) -> list[dict[str, str]
                     "item_id": item.id,
                     "operation_id": operation_id,
                     "agent_span_id": agent_span_id,
-                    "eval_context_span_id": f"{span_ctx.span_id:016x}",
+                    "eval_event_parent_span_id": agent_span_id,
                     "status": "OK",
                 }
             )
@@ -184,8 +184,9 @@ def cli() -> None:
     results = asyncio.run(run(args.dataset, args.agent_service_url))
 
     print(
-        "\nDone. Agent authored its own span; evaluation_context (with "
-        "ground_truth) was ATTACHED as a child of that span in the same trace."
+        "\nDone. Agent authored its own span; a gen_ai.evaluation.result event "
+        "(with ground_truth) was EMITTED stamped with that span's ids, in the "
+        "same trace (operation_ParentId == the agent span)."
     )
 
     print("\n=== App Insights operation_Id per item ===")
