@@ -100,28 +100,35 @@ class EvaluationSummary:
 
 
 def _build_evaluator_config(
-    name: str, evaluator_name: str, model_deployment_name: str, *, with_ground_truth: bool
+    name: str, evaluator_name: str, model_deployment_name: str, *, with_ground_truth: bool, needs_model: bool
 ) -> dict[str, Any]:
     """Build one ``azure_ai_evaluator`` testing-criterion block.
 
-    For the ground-truth evaluator we deliberately map ``ground_truth`` to
-    ``{{sample.ground_truth}}`` -- a field the ``azure_ai_traces`` scenario does
-    not populate -- so the criterion fails, demonstrating the GT gap.
+    ``needs_model`` controls whether a model deployment is attached via
+    ``initialization_parameters``. Model-graded evaluators (e.g. ``coherence``)
+    require a deployment; lexical evaluators (e.g. ``f1_score``) do not accept a
+    model and error if one is supplied, so their criterion omits it.
+
+    For the ground-truth evaluator ``ground_truth`` is mapped to
+    ``{{item.ground_truth}}`` -- the field surfaced from the trace's
+    ``gen_ai.evaluation.ground_truth`` attribute when present.
     """
     data_mapping: dict[str, str] = {
-        "query": "{{sample.query}}",
-        "response": "{{sample.response}}",
+        "query": "{{item.query}}",
+        "response": "{{item.response}}",
     }
     if with_ground_truth:
-        data_mapping["ground_truth"] = "{{sample.ground_truth}}"
+        data_mapping["ground_truth"] = "{{item.ground_truth}}"
 
-    return {
+    config: dict[str, Any] = {
         "type": "azure_ai_evaluator",
         "name": name,
         "evaluator_name": evaluator_name,
         "data_mapping": data_mapping,
-        "initialization_parameters": {"deployment_name": model_deployment_name},
     }
+    if needs_model:
+        config["initialization_parameters"] = {"deployment_name": model_deployment_name}
+    return config
 
 
 def evaluate_traces(
@@ -174,12 +181,14 @@ def evaluate_traces(
             NON_GT_EVALUATOR_ID,
             model_deployment_name,
             with_ground_truth=False,
+            needs_model=True,
         ),
         _build_evaluator_config(
             GT_EVALUATOR_NAME,
             GT_EVALUATOR_ID,
             model_deployment_name,
             with_ground_truth=True,
+            needs_model=False,
         ),
     ]
 
