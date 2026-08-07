@@ -59,6 +59,11 @@ NON_GT_EVALUATOR_ID = "builtin.coherence"
 GT_EVALUATOR_NAME = "similarity"
 GT_EVALUATOR_ID = "builtin.similarity"
 
+# Pass threshold for the model-graded similarity score (1-5 ordinal). Matches
+# the working REST payload's initialization_parameters.threshold. A trace scores
+# `passed` when its similarity score is >= this value.
+GT_EVALUATOR_THRESHOLD = 3
+
 # Terminal states of an eval run.
 _TERMINAL_STATES = {"completed", "failed", "canceled"}
 
@@ -105,7 +110,13 @@ class EvaluationSummary:
 
 
 def _build_evaluator_config(
-    name: str, evaluator_name: str, model_deployment_name: str, *, with_ground_truth: bool, needs_model: bool
+    name: str,
+    evaluator_name: str,
+    model_deployment_name: str,
+    *,
+    with_ground_truth: bool,
+    needs_model: bool,
+    threshold: int | None = None,
 ) -> dict[str, Any]:
     """Build one ``azure_ai_evaluator`` testing-criterion block.
 
@@ -132,14 +143,16 @@ def _build_evaluator_config(
         "data_mapping": data_mapping,
     }
     if needs_model:
-        config["initialization_parameters"] = {"deployment_name": model_deployment_name}
+        init_params: dict[str, Any] = {"deployment_name": model_deployment_name}
+        if threshold is not None:
+            init_params["threshold"] = threshold
+        config["initialization_parameters"] = init_params
     return config
 
 
 def evaluate_traces(
     trace_ids: list[str],
     *,
-    lookback_hours: int = 1,
     poll_seconds: int = 5,
     timeout_seconds: int = 600,
 ) -> EvaluationSummary:
@@ -153,7 +166,6 @@ def evaluate_traces(
     Args:
         trace_ids: App Insights ``operation_Id``s (== OTel ``trace_id``s) to
             evaluate. Typically the successful rows from the driver run.
-        lookback_hours: Trace query lookback window passed to the eval service.
         poll_seconds: Delay between run-status polls.
         timeout_seconds: Give up waiting after this many seconds.
 
@@ -194,6 +206,7 @@ def evaluate_traces(
             model_deployment_name,
             with_ground_truth=True,
             needs_model=True,
+            threshold=GT_EVALUATOR_THRESHOLD,
         ),
     ]
 
@@ -227,10 +240,19 @@ def evaluate_traces(
         )
         logger.info("evaluation created (id=%s)", eval_object.id)
 
+        # Match the working REST payload's run envelope exactly: the trace data
+        # source is `azure_ai_trace_data_source_preview` wrapping a
+        # `trace_source` of type `trace_id_source`. The older flat
+        # `azure_ai_traces_preview` shape pulls traces too (coherence scored),
+        # but hands the model-graded `similarity` evaluator a `response` in a
+        # shape it rejects as "not in the expected format" -> Skipped. This
+        # envelope normalizes `response` so similarity actually scores.
         data_source = {
-            "type": "azure_ai_traces_preview",
-            "trace_ids": list(trace_ids),
-            "lookback_hours": lookback_hours,
+            "type": "azure_ai_trace_data_source_preview",
+            "trace_source": {
+                "type": "trace_id_source",
+                "trace_ids": list(trace_ids),
+            },
         }
         run = client.evals.runs.create(
             eval_id=eval_object.id,
