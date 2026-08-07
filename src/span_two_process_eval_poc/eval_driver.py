@@ -151,7 +151,7 @@ def cli() -> None:
         default=os.environ.get("RUN_EVALUATION") == "1",
         help=(
             "After attaching ground truth, run the trace-id evaluation "
-            "post-processing step (builtin.coherence + builtin.f1_score) over "
+            "post-processing step (builtin.coherence + builtin.response_completeness) over "
             "the run's traces. Off by default; also enabled via RUN_EVALUATION=1."
         ),
     )
