@@ -49,10 +49,15 @@ logger = logging.getLogger("evaluation")
 NON_GT_EVALUATOR_NAME = "coherence"
 NON_GT_EVALUATOR_ID = "builtin.coherence"
 
-# Evaluator that REQUIRES ground truth. Mapped to {{sample.ground_truth}}, which
-# the azure_ai_traces scenario does not provide -> expected to fail.
-GT_EVALUATOR_NAME = "f1_score"
-GT_EVALUATOR_ID = "builtin.f1_score"
+# Evaluator that REQUIRES ground truth. Mapped to {{item.ground_truth}}, which
+# is now surfaced from the trace's gen_ai.evaluation.ground_truth attribute by
+# the RAISvc ground-truth KQL lift. We use the model-graded `similarity`
+# evaluator (not the lexical `f1_score`): similarity declares `ground_truth` in
+# its data_schema (so the mapping is not stripped) AND tolerates the message-list
+# shape that trace `response` arrives in -- the lexical evaluators crash on it
+# with `'list' object has no attribute 'lower'`.
+GT_EVALUATOR_NAME = "similarity"
+GT_EVALUATOR_ID = "builtin.similarity"
 
 # Terminal states of an eval run.
 _TERMINAL_STATES = {"completed", "failed", "canceled"}
@@ -188,7 +193,7 @@ def evaluate_traces(
             GT_EVALUATOR_ID,
             model_deployment_name,
             with_ground_truth=True,
-            needs_model=False,
+            needs_model=True,
         ),
     ]
 
@@ -199,7 +204,25 @@ def evaluate_traces(
     ):
         eval_object = client.evals.create(
             name="span_two_process_trace_eval",
-            data_source_config={"type": "azure_ai_source", "scenario": "traces"},
+            # Custom item_schema that DECLARES ground_truth (plus query/response/
+            # context). This is what keeps the ground_truth data_mapping from
+            # being stripped: the eval service drops any mapped field the schema
+            # does not declare. The auto-derived `azure_ai_source`/`traces`
+            # schema omits ground_truth, so mappings to it were silently removed.
+            data_source_config={
+                "type": "custom",
+                "include_sample_schema": False,
+                "item_schema": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "response": {"type": "string"},
+                        "context": {"type": "string"},
+                        "ground_truth": {"type": "string"},
+                    },
+                    "required": ["query", "response", "ground_truth"],
+                },
+            },
             testing_criteria=testing_criteria,  # type: ignore[arg-type]
         )
         logger.info("evaluation created (id=%s)", eval_object.id)
@@ -303,20 +326,18 @@ def _is_errored(res: Any) -> bool:
 def check_evaluation_results(summary: EvaluationSummary) -> bool:
     """Check the eval outcome against the POC's expectations.
 
-    Expectations:
+    Expectations (post ground-truth-lift):
       * The **non-GT** evaluator (``coherence``) should produce at least one
         passing result -- it works purely from ``query`` + ``response`` on the
         trace.
-      * The **GT-requiring** evaluator (``f1_score``) is **expected to fail** for
-        every trace, because the ``azure_ai_traces`` scenario does not surface
-        our custom ``gen_ai.evaluation.ground_truth`` attribute as
-        ``sample.ground_truth``.
+      * The **GT-requiring** evaluator (``similarity``) should now **score** at
+        least one trace, because the RAISvc ground-truth KQL lift surfaces our
+        custom ``gen_ai.evaluation.ground_truth`` attribute as
+        ``sample.ground_truth`` and the custom item_schema keeps the mapping.
 
     Returns:
         ``True`` if reality matches those expectations (non-GT passed AND GT
-        evaluator failed/errored), else ``False``. Prints a readable report
-        either way. Does not raise on the "expected failure" -- that failure is
-        the intended demonstration.
+        evaluator scored), else ``False``. Prints a readable report either way.
     """
     non_gt = summary.criteria.get(NON_GT_EVALUATOR_NAME)
     gt = summary.criteria.get(GT_EVALUATOR_NAME)
@@ -332,25 +353,24 @@ def check_evaluation_results(summary: EvaluationSummary) -> bool:
         )
 
     # Distinguish a service/infrastructure failure (nothing was scored) from a
-    # genuine per-criterion outcome. Only the latter meaningfully tests the
-    # ground-truth gap.
+    # genuine per-criterion outcome.
     if summary.infra_failed:
         print("\n--- Run did NOT produce results (infrastructure failure) ---")
         if summary.run_error:
             print(f"  run error: {summary.run_error[:500]}")
         print(
             "\n[INCONCLUSIVE] The eval service failed before scoring any trace "
-            "(0 output items), so the ground-truth expectation could not be "
-            "tested. This is a backend/resource problem, not a POC bug -- re-run "
+            "(0 output items), so the ground-truth flow could not be tested. "
+            "This is a backend/resource problem, not a POC bug -- re-run "
             "against a healthy Foundry project."
         )
         return False
 
     non_gt_ok = non_gt is not None and non_gt.any_passed
-    # GT evaluator is expected to FAIL: either it errored everywhere, or the
-    # service produced no successful/passing GT results.
-    gt_failed_as_expected = (
-        gt is None or gt.all_errored or (gt.total > 0 and not gt.any_passed)
+    # GT evaluator is now expected to SCORE: it must have run without erroring
+    # on every trace and produced at least one passing result.
+    gt_scored = (
+        gt is not None and gt.total > 0 and gt.any_passed and not gt.all_errored
     )
 
     print("\n--- Expectation check ---")
@@ -359,22 +379,21 @@ def check_evaluation_results(summary: EvaluationSummary) -> bool:
         f"{'YES (expected)' if non_gt_ok else 'NO (UNEXPECTED)'}"
     )
     print(
-        f"  GT '{GT_EVALUATOR_NAME}' failed (no ground_truth in trace) : "
-        f"{'YES (expected)' if gt_failed_as_expected else 'NO (UNEXPECTED)'}"
+        f"  GT '{GT_EVALUATOR_NAME}' scored (ground_truth surfaced) : "
+        f"{'YES (expected)' if gt_scored else 'NO (UNEXPECTED)'}"
     )
 
-    meets_expectations = non_gt_ok and gt_failed_as_expected
+    meets_expectations = non_gt_ok and gt_scored
     if meets_expectations:
         print(
             "\n[OK] E2E matches expectations: coherence scored the trace, and the "
-            "ground-truth evaluator failed because the trace does not yet expose "
-            "gen_ai.evaluation.ground_truth as sample.ground_truth. Surfacing "
-            "that attribute is the next (KQL / trace-mapping) step."
+            "ground-truth evaluator scored because the RAISvc lift surfaced "
+            "gen_ai.evaluation.ground_truth as sample.ground_truth."
         )
     else:
         print(
             "\n[FAIL] E2E did NOT match expectations -- inspect the eval run output "
             "items above. (Either coherence did not score, or the GT evaluator "
-            "unexpectedly succeeded.)"
+            "did not score -- check that ground_truth reached the evaluator.)"
         )
     return meets_expectations
