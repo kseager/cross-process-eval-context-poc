@@ -1,30 +1,11 @@
-"""Driver that attaches an evaluation span to an agent's own trace.
+"""Driver that attaches evaluation ground truth to an agent's own trace.
 
-The agent runs first, as a complete black box, with no incoming
-``traceparent``. It authors its own ``invoke_agent`` span and returns that span's
-``(trace_id, span_id)``. The driver then opens an ``evaluation_context`` span as
-a **child** of the returned span -- same trace, ``operation_ParentId`` == the
-agent's span -- and stamps ground truth on it.
-
-Properties:
-
-* **Zero request-path coupling.** The agent needs no ``traceparent`` handling or
-  context propagation. Any agent that reports back the ``(trace_id, span_id)``
-  of the span it emitted works.
-* **No manufactured outer span.** The agent's ``invoke_agent`` span stays the
-  root; no parent is fabricated above it.
-* Ground truth is a child *annotation* of the agent run, in the same trace.
-
-Resulting span tree (one trace)::
-
-    invoke_agent <name>                (agent-service, framework's own span)
-    │  └─ chat ...                      (agent framework)
-    └─ evaluation_context              (driver, attached via returned ids)
-          • attribute: gen_ai.evaluation.ground_truth = {...}
-
-The driver only attaches ground truth to the trace; whether an eval service
-later reads that ground truth off the attached child span is a separate
-consumption concern (see the optional ``--evaluate`` post-processing step).
+The agent runs first as a black box with no incoming ``traceparent``. It authors
+its own ``invoke_agent`` span and returns that span's ``(trace_id, span_id)``.
+The driver then emits a ``gen_ai.evaluation.result`` event stamped with those
+ids, correlating ground truth to the agent's span in the same trace
+(``operation_ParentId`` == the agent's span) without mutating it. Optionally,
+``--evaluate`` runs a trace-id evaluation post-processing step over the run.
 """
 
 from __future__ import annotations
@@ -55,9 +36,6 @@ SERVICE_NAME = "eval-driver"
 DEFAULT_DATASET = Path(__file__).resolve().parents[2] / "data" / "dataset.jsonl"
 DEFAULT_AGENT_SERVICE_URL = "http://localhost:8002/invoke-standalone"
 
-# Trace flags to assume for the returned agent span (sampled). The agent-service
-# emits sampled spans, so we reconstruct the remote parent as sampled too;
-# otherwise the attached child could be dropped by the sampler.
 _SAMPLED_FLAGS = 0x01
 
 
@@ -83,7 +61,7 @@ async def run(dataset_path: Path, agent_service_url: str) -> list[dict[str, str]
             print(f"\n[{item.id}]")
             print(f"  query          : {item.query}")
 
-            # 1. Invoke the agent as a BLACK BOX -- no traceparent, no context.
+            # Invoke the agent as a black box -- no traceparent, no context.
             try:
                 resp = await client.post(
                     agent_service_url,
@@ -106,11 +84,10 @@ async def run(dataset_path: Path, agent_service_url: str) -> list[dict[str, str]
             print(f"  response       : {response_text}")
             print(f"  ground_truth   : {item.ground_truth}")
 
-            # 2. Emit a gen_ai.evaluation.result EVENT stamped with the agent's
-            #    (trace_id, span_id). This is a log record correlated to the
-            #    agent's own invoke_agent span (operation_ParentId == agent span
-            #    id) in the SAME trace -- no child span is created and the
-            #    already-ended agent span is not mutated.
+            # Emit a gen_ai.evaluation.result event stamped with the agent's
+            # (trace_id, span_id): a log record correlated to the agent's own
+            # invoke_agent span (operation_ParentId == agent span id) in the
+            # same trace, without mutating the already-ended span.
             operation_id = agent_trace_id
 
             ground_truth_json = json.dumps(item.ground_truth, ensure_ascii=False)
@@ -132,7 +109,6 @@ async def run(dataset_path: Path, agent_service_url: str) -> list[dict[str, str]
                 f"(parent=agent span {agent_span_id})"
             )
 
-            # Sanity: the event must be stamped into the agent's trace.
             assert operation_id == agent_trace_id, (
                 "evaluation event is not stamped into the agent's trace"
             )
@@ -219,7 +195,6 @@ def cli() -> None:
         print("\nNo successful traces to evaluate; skipping evaluation step.")
         return
 
-    # Import lazily so the azure eval SDK is only required when --evaluate is set.
     from .evaluation import check_evaluation_results, evaluate_traces
 
     print(f"\n=== Running trace-id evaluation over {len(op_ids)} trace(s) ===")

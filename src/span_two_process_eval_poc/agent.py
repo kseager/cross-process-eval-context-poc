@@ -24,13 +24,10 @@ DEFAULT_INSTRUCTIONS = (
 class _CompatFoundryChatClient(FoundryChatClient):
     """FoundryChatClient that does not opt into encrypted reasoning content.
 
-    For stateless (single-turn) requests the base OpenAI Responses client
-    auto-appends ``include=["reasoning.encrypted_content"]`` to preserve
-    reasoning across turns. Some Foundry project/model combinations reject that
-    with ``400 "Encrypted content is not supported with this model."``. The
-    Foundry *agent* client strips this automatically; the *chat* client does
-    not, so we mirror that strip here. This is a service-compatibility shim, not
-    evaluation logic.
+    Some Foundry project/model combinations reject the base client's
+    auto-appended ``include=["reasoning.encrypted_content"]`` with a 400. The
+    Foundry agent client strips this automatically; the chat client does not, so
+    we mirror that strip here. This is a service-compatibility shim.
     """
 
     async def _prepare_options(

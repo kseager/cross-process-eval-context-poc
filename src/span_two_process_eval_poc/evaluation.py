@@ -1,35 +1,10 @@
-"""Trace-based evaluation -- the **post-processing step** of the POC.
+"""Trace-based evaluation: the post-processing step of the POC.
 
-After the driver has run every dataset row (each producing one App Insights
-trace whose ``operation_Id`` == the OTel ``trace_id``), this module evaluates
-those traces **by trace id** using Azure AI Foundry's built-in evaluators via
-the OpenAI-compatible ``evals`` API.
-
-This mirrors the SDK sample ``sample_evaluations_builtin_with_traces.py``:
-
-- ``data_source_config`` = ``{"type": "azure_ai_source", "scenario": "traces"}``
-- ``data_source``        = ``{"type": "azure_ai_traces", "trace_ids": [...]}``
-
-The eval service pulls the ``query``/``response`` off each trace's agent spans
-and exposes them to evaluators as ``{{sample.query}}`` / ``{{sample.response}}``.
-
-Two evaluators are wired on purpose, to demonstrate the ground-truth gap this
-POC exists to surface:
-
-1. **No ground truth** -- ``builtin.coherence``. Scores the response using only
-   ``query`` + ``response`` pulled from the trace. This is **expected to pass**.
-2. **Requires ground truth** -- ``builtin.f1_score``. Needs a ``ground_truth``
-   input. Ground truth is stamped as the custom attribute
-   ``gen_ai.evaluation.ground_truth`` on the driver-authored
-   ``evaluation_context`` span, but the ``azure_ai_traces`` sample schema only
-   exposes ``sample.query`` / ``sample.response`` / ``sample.tool_definitions``
-   -- it does **not** surface that custom attribute. So this criterion has no
-   ``ground_truth`` to read and is **expected to fail**.
-
-   That failure is the whole point: it proves that today the eval service cannot
-   consume ground truth stamped as a trace attribute. Making the GT attribute
-   flow into ``sample.ground_truth`` is the next piece of work (the KQL / trace
-   mapping change).
+Evaluates App Insights traces by ``operation_Id`` (== OTel ``trace_id``) using
+Azure AI Foundry's built-in evaluators via the OpenAI-compatible ``evals`` API.
+Two evaluators are wired: ``builtin.coherence`` (no ground truth required) and
+``builtin.similarity`` (requires ground truth surfaced as ``sample.ground_truth``
+by the RAISvc ground-truth lift).
 """
 
 from __future__ import annotations
@@ -45,26 +20,14 @@ from azure.identity import DefaultAzureCredential
 
 logger = logging.getLogger("evaluation")
 
-# Evaluator that needs NO ground truth: judges the response from query+response.
 NON_GT_EVALUATOR_NAME = "coherence"
 NON_GT_EVALUATOR_ID = "builtin.coherence"
 
-# Evaluator that REQUIRES ground truth. Mapped to {{item.ground_truth}}, which
-# is now surfaced from the trace's gen_ai.evaluation.ground_truth attribute by
-# the RAISvc ground-truth KQL lift. We use the model-graded `similarity`
-# evaluator (not the lexical `f1_score`): similarity declares `ground_truth` in
-# its data_schema (so the mapping is not stripped) AND tolerates the message-list
-# shape that trace `response` arrives in -- the lexical evaluators crash on it
-# with `'list' object has no attribute 'lower'`.
 GT_EVALUATOR_NAME = "similarity"
 GT_EVALUATOR_ID = "builtin.similarity"
 
-# Pass threshold for the model-graded similarity score (1-5 ordinal). Matches
-# the working REST payload's initialization_parameters.threshold. A trace scores
-# `passed` when its similarity score is >= this value.
 GT_EVALUATOR_THRESHOLD = 3
 
-# Terminal states of an eval run.
 _TERMINAL_STATES = {"completed", "failed", "canceled"}
 
 
@@ -99,13 +62,7 @@ class EvaluationSummary:
 
     @property
     def infra_failed(self) -> bool:
-        """True if the run failed at the service level (no items were scored).
-
-        Distinguishes an infrastructure/service failure (e.g. the Foundry
-        workspace identity being unavailable) from a legitimate per-criterion
-        outcome. In the infra-failed case no evaluator actually ran, so the
-        ground-truth expectation check is not meaningful.
-        """
+        """True if the run failed at the service level (no items were scored)."""
         return self.status != "completed" and self.total_items == 0
 
 
@@ -118,17 +75,7 @@ def _build_evaluator_config(
     needs_model: bool,
     threshold: int | None = None,
 ) -> dict[str, Any]:
-    """Build one ``azure_ai_evaluator`` testing-criterion block.
-
-    ``needs_model`` controls whether a model deployment is attached via
-    ``initialization_parameters``. Model-graded evaluators (e.g. ``coherence``)
-    require a deployment; lexical evaluators (e.g. ``f1_score``) do not accept a
-    model and error if one is supplied, so their criterion omits it.
-
-    For the ground-truth evaluator ``ground_truth`` is mapped to
-    ``{{item.ground_truth}}`` -- the field surfaced from the trace's
-    ``gen_ai.evaluation.ground_truth`` attribute when present.
-    """
+    """Build one ``azure_ai_evaluator`` testing-criterion block."""
     data_mapping: dict[str, str] = {
         "query": "{{item.query}}",
         "response": "{{item.response}}",
@@ -158,14 +105,8 @@ def evaluate_traces(
 ) -> EvaluationSummary:
     """Evaluate the given App Insights traces by id.
 
-    Runs two built-in evaluators over the traces: one that needs no ground truth
-    (``builtin.coherence``) and one that requires it (``builtin.f1_score``). The
-    ground-truth evaluator is expected to fail because the trace scenario does
-    not expose our custom ``gen_ai.evaluation.ground_truth`` attribute.
-
     Args:
-        trace_ids: App Insights ``operation_Id``s (== OTel ``trace_id``s) to
-            evaluate. Typically the successful rows from the driver run.
+        trace_ids: App Insights ``operation_Id``s (== OTel ``trace_id``s).
         poll_seconds: Delay between run-status polls.
         timeout_seconds: Give up waiting after this many seconds.
 
@@ -173,8 +114,8 @@ def evaluate_traces(
         An :class:`EvaluationSummary` with per-criterion pass/error counts.
 
     Raises:
-        RuntimeError: If ``FOUNDRY_PROJECT_ENDPOINT`` or the model deployment
-            name is not set, or if no trace ids are provided.
+        RuntimeError: If the endpoint or model deployment name is not set, or if
+            no trace ids are provided.
     """
     if not trace_ids:
         raise RuntimeError("No trace ids to evaluate.")
@@ -217,11 +158,6 @@ def evaluate_traces(
     ):
         eval_object = client.evals.create(
             name="span_two_process_trace_eval",
-            # Custom item_schema that DECLARES ground_truth (plus query/response/
-            # context). This is what keeps the ground_truth data_mapping from
-            # being stripped: the eval service drops any mapped field the schema
-            # does not declare. The auto-derived `azure_ai_source`/`traces`
-            # schema omits ground_truth, so mappings to it were silently removed.
             data_source_config={
                 "type": "custom",
                 "include_sample_schema": False,
@@ -240,13 +176,6 @@ def evaluate_traces(
         )
         logger.info("evaluation created (id=%s)", eval_object.id)
 
-        # Match the working REST payload's run envelope exactly: the trace data
-        # source is `azure_ai_trace_data_source_preview` wrapping a
-        # `trace_source` of type `trace_id_source`. The older flat
-        # `azure_ai_traces_preview` shape pulls traces too (coherence scored),
-        # but hands the model-graded `similarity` evaluator a `response` in a
-        # shape it rejects as "not in the expected format" -> Skipped. This
-        # envelope normalizes `response` so similarity actually scores.
         data_source = {
             "type": "azure_ai_trace_data_source_preview",
             "trace_source": {
@@ -289,21 +218,16 @@ def evaluate_traces(
 def _summarize_output_items(
     client: Any, eval_id: str, run_id: str
 ) -> tuple[dict[str, CriterionOutcome], int]:
-    """Aggregate per-criterion pass/error counts from the run's output items.
-
-    Returns a ``(criteria, total_items)`` tuple; ``total_items`` is the number
-    of output items the run produced (0 signals nothing was scored).
-    """
+    """Aggregate per-criterion pass/error counts from the run's output items."""
     counts: dict[str, dict[str, int]] = {}
     try:
         output_items = list(client.evals.runs.output_items.list(run_id=run_id, eval_id=eval_id))
-    except Exception as exc:  # pragma: no cover - service/transport variance
+    except Exception as exc:
         logger.warning("could not list output items: %s", exc)
         return {}, 0
 
     for item in output_items:
         for res in getattr(item, "results", None) or []:
-            # results entries are dict-like across SDK versions.
             name = _get(res, "name") or _get(res, "evaluator_name") or "unknown"
             bucket = counts.setdefault(name, {"passed": 0, "errored": 0, "total": 0})
             bucket["total"] += 1
@@ -348,18 +272,13 @@ def _is_errored(res: Any) -> bool:
 def check_evaluation_results(summary: EvaluationSummary) -> bool:
     """Check the eval outcome against the POC's expectations.
 
-    Expectations (post ground-truth-lift):
-      * The **non-GT** evaluator (``coherence``) should produce at least one
-        passing result -- it works purely from ``query`` + ``response`` on the
-        trace.
-      * The **GT-requiring** evaluator (``similarity``) should now **score** at
-        least one trace, because the RAISvc ground-truth KQL lift surfaces our
-        custom ``gen_ai.evaluation.ground_truth`` attribute as
-        ``sample.ground_truth`` and the custom item_schema keeps the mapping.
+    Expects the non-GT evaluator (``coherence``) to produce at least one passing
+    result, and the GT-requiring evaluator (``similarity``) to score at least one
+    trace once ground truth is surfaced as ``sample.ground_truth``.
 
     Returns:
-        ``True`` if reality matches those expectations (non-GT passed AND GT
-        evaluator scored), else ``False``. Prints a readable report either way.
+        ``True`` if reality matches those expectations, else ``False``. Prints a
+        readable report either way.
     """
     non_gt = summary.criteria.get(NON_GT_EVALUATOR_NAME)
     gt = summary.criteria.get(GT_EVALUATOR_NAME)
@@ -374,8 +293,6 @@ def check_evaluation_results(summary: EvaluationSummary) -> bool:
             f"  {name:<12} passed={c.passed} errored={c.errored} total={c.total}"
         )
 
-    # Distinguish a service/infrastructure failure (nothing was scored) from a
-    # genuine per-criterion outcome.
     if summary.infra_failed:
         print("\n--- Run did NOT produce results (infrastructure failure) ---")
         if summary.run_error:
@@ -389,8 +306,6 @@ def check_evaluation_results(summary: EvaluationSummary) -> bool:
         return False
 
     non_gt_ok = non_gt is not None and non_gt.any_passed
-    # GT evaluator is now expected to SCORE: it must have run without erroring
-    # on every trace and produced at least one passing result.
     gt_scored = (
         gt is not None and gt.total > 0 and gt.any_passed and not gt.all_errored
     )
