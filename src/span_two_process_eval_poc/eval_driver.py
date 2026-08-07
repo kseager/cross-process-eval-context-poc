@@ -59,13 +59,13 @@ async def run(dataset_path: Path, agent_service_url: str) -> list[dict[str, str]
     async with httpx.AsyncClient(timeout=120.0) as client:
         for item in rows:
             print(f"\n[{item.id}]")
-            print(f"  query          : {item.query}")
+            print(f"  query          : {item.user_text}")
 
             # Invoke the agent as a black box.
             try:
                 resp = await client.post(
                     agent_service_url,
-                    json={"item_id": item.id, "query": item.query},
+                    json={"item_id": item.id, "messages": item.messages},
                 )
                 resp.raise_for_status()
                 agent_result = resp.json()

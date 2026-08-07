@@ -1,5 +1,5 @@
-{"id": "q1", "query": "What is the capital of France?", "ground_truth": "Paris"}
-{"id": "q2", "query": "Who wrote the play Romeo and Juliet?", "ground_truth": "William Shakespeare"}
-{"id": "q3", "query": "What is the chemical symbol for gold?", "ground_truth": "Au"}
-{"id": "q4", "query": "How many continents are there on Earth?", "ground_truth": "Seven"}
-{"id": "q5", "query": "What planet is known as the Red Planet?", "ground_truth": "Mars"}
+{"id": "q1", "messages": [{"role": "user", "content": "What is the capital of France?"}], "ground_truth": "Paris"}
+{"id": "q2", "messages": [{"role": "user", "content": "Who wrote the play Romeo and Juliet?"}], "ground_truth": "William Shakespeare"}
+{"id": "q3", "messages": [{"role": "user", "content": "What is the chemical symbol for gold?"}], "ground_truth": "Au"}
+{"id": "q4", "messages": [{"role": "user", "content": "How many continents are there on Earth?"}], "ground_truth": "Seven"}
+{"id": "q5", "messages": [{"role": "user", "content": "What planet is known as the Red Planet?"}], "ground_truth": "Mars"}

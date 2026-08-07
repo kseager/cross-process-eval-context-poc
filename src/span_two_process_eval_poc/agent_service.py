@@ -16,7 +16,9 @@ from __future__ import annotations
 import contextvars
 import logging
 import os
+from typing import Any
 
+from agent_framework import Message
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from opentelemetry import trace
@@ -66,10 +68,14 @@ _agent = None
 
 
 class InvokeRequest(BaseModel):
-    """Payload the caller sends to invoke the agent."""
+    """Payload the caller sends to invoke the agent.
+
+    ``messages`` is the standard agent-input contract: a list of
+    ``{"role", "content"}`` turns (single- or multi-turn).
+    """
 
     item_id: str
-    query: str
+    messages: list[dict[str, Any]]
 
 
 @app.on_event("startup")
@@ -113,7 +119,10 @@ async def invoke_standalone(req: InvokeRequest) -> StandaloneResponse:
 
     token = _invoke_agent_ctx.set(None)
     try:
-        result = await _agent.run(req.query)
+        run_messages = [
+            Message(m["role"], [m["content"]]) for m in req.messages
+        ]
+        result = await _agent.run(run_messages)
         response_text = str(result)
         captured = _invoke_agent_ctx.get()
     finally:

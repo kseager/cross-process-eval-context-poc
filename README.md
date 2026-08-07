@@ -75,12 +75,14 @@ mechanics — just credentials and the destination.
 
 ### Step 3 — build your dataset
 
-Put your `query` / `ground_truth` pairs in `data/dataset.jsonl`, one JSON object
-per line. `ground_truth` can be a string or a structured object:
+Put your input `messages` and `ground_truth` in `data/dataset.jsonl`, one JSON
+object per line. `messages` is the standard agent-input contract (a list of
+`{"role", "content"}` turns); `ground_truth` can be a string or a structured
+object:
 
 ```jsonl
-{"id": "q1", "query": "What is the capital of France?", "ground_truth": "Paris"}
-{"id": "q2", "query": "Who wrote Romeo and Juliet?", "ground_truth": "William Shakespeare"}
+{"id": "q1", "messages": [{"role": "user", "content": "What is the capital of France?"}], "ground_truth": "Paris"}
+{"id": "q2", "messages": [{"role": "user", "content": "Who wrote Romeo and Juliet?"}], "ground_truth": "William Shakespeare"}
 ```
 
 ### Step 4 — run it (two processes)
