@@ -4,7 +4,9 @@ Evaluates App Insights traces by ``operation_Id`` (== OTel ``trace_id``) using
 Azure AI Foundry's built-in evaluators via the OpenAI-compatible ``evals`` API.
 Two evaluators are wired: ``builtin.coherence`` (no ground truth required) and
 ``builtin.response_completeness`` (requires ground truth surfaced as ``sample.ground_truth``
-by the RAISvc ground-truth lift).
+by the RAISvc ground-truth lift). A third, ``builtin.similarity`` (a reference /
+string-based evaluator consuming query, response, and ground_truth), measures how
+close the response is to the ground truth.
 """
 
 from __future__ import annotations
@@ -25,6 +27,12 @@ NON_GT_EVALUATOR_ID = "builtin.coherence"
 
 GT_EVALUATOR_NAME = "response_completeness"
 GT_EVALUATOR_ID = "builtin.response_completeness"
+
+# Reference / string-based evaluator: consumes query, response, and ground_truth.
+# Requires query/response to be plain strings (surfaced by the RAISvc turn-level
+# projection of trace message lists), otherwise it skips (label=not_applicable).
+SIMILARITY_EVALUATOR_NAME = "similarity"
+SIMILARITY_EVALUATOR_ID = "builtin.similarity"
 
 _TERMINAL_STATES = {"completed", "failed", "canceled"}
 
@@ -146,6 +154,14 @@ def evaluate_traces(
             with_ground_truth=True,
             needs_model=True,
             with_query=False,
+        ),
+        _build_evaluator_config(
+            SIMILARITY_EVALUATOR_NAME,
+            SIMILARITY_EVALUATOR_ID,
+            model_deployment_name,
+            with_ground_truth=True,
+            needs_model=True,
+            with_query=True,
         ),
     ]
 
