@@ -79,6 +79,7 @@ def build_agent(
             "AZURE_AI_MODEL_DEPLOYMENT_NAME or FOUNDRY_MODEL_NAME."
         )
 
+    # Replace this client when using a non-Foundry agent.
     client = _CompatFoundryChatClient(
         project_endpoint=project_endpoint,
         model=model_name,

@@ -39,6 +39,28 @@ DEFAULT_AGENT_SERVICE_URL = "http://localhost:8002/invoke-standalone"
 _SAMPLED_FLAGS = 0x01
 
 
+def _normalize_otel_id(value: object, width: int, field_name: str) -> str:
+    if isinstance(value, bool):
+        raise ValueError(f"{field_name} must be a hexadecimal OpenTelemetry id")
+
+    if isinstance(value, int):
+        numeric_id = value
+    elif isinstance(value, str):
+        hex_id = value.strip().lower()
+        if hex_id.startswith("0x"):
+            hex_id = hex_id[2:]
+        if not hex_id or any(char not in "0123456789abcdef" for char in hex_id):
+            raise ValueError(f"{field_name} must be hexadecimal")
+        numeric_id = int(hex_id, 16)
+    else:
+        raise ValueError(f"{field_name} must be a hexadecimal string or integer")
+
+    if numeric_id <= 0 or numeric_id >= 1 << (width * 4):
+        raise ValueError(f"{field_name} must fit in {width} hexadecimal characters")
+
+    return f"{numeric_id:0{width}x}"
+
+
 async def run(dataset_path: Path, agent_service_url: str) -> list[dict[str, str]]:
     """Drive the evaluation loop.
 
@@ -77,11 +99,22 @@ async def run(dataset_path: Path, agent_service_url: str) -> list[dict[str, str]
                 )
                 continue
 
-            response_text = agent_result["response"]
-            agent_trace_id = agent_result["agent_trace_id"]
-            agent_span_id = agent_result["agent_span_id"]
+            try:
+                agent_trace_id = _normalize_otel_id(
+                    agent_result["agent_trace_id"], 32, "agent_trace_id"
+                )
+                agent_span_id = _normalize_otel_id(
+                    agent_result["agent_span_id"], 16, "agent_span_id"
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                logger.warning("invalid agent response for %s: %s", item.id, exc)
+                print(f"  ERROR          : {exc}")
+                results.append(
+                    {"item_id": item.id, "operation_id": "", "status": "ERROR"}
+                )
+                continue
+
             print(f"  agent_span     : trace_id={agent_trace_id} span_id={agent_span_id}")
-            print(f"  response       : {response_text}")
             print(f"  ground_truth   : {item.ground_truth}")
 
             # Emit a gen_ai.evaluation.context event stamped with the agent's

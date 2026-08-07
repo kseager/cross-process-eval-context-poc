@@ -94,16 +94,14 @@ def _startup() -> None:
 
 
 class StandaloneResponse(BaseModel):
-    """Agent answer plus the ids of the span the agent authored.
+    """The ids of the span the agent authored.
 
     ``agent_trace_id`` / ``agent_span_id`` identify the ``invoke_agent`` span the
-    driver parents its ``evaluation_context`` span to. Both are lowercase hex.
+    driver parents its ``evaluation_context`` span to.
     """
 
-    item_id: str
-    response: str
-    agent_trace_id: str
-    agent_span_id: str
+    agent_trace_id: int
+    agent_span_id: int
 
 
 @app.post("/invoke-standalone", response_model=StandaloneResponse)
@@ -140,10 +138,9 @@ async def invoke_standalone(req: InvokeRequest) -> StandaloneResponse:
         span_id,
         req.item_id,
     )
+    logger.info("agent response for item=%s: %s", req.item_id, response_text)
 
     return StandaloneResponse(
-        item_id=req.item_id,
-        response=response_text,
-        agent_trace_id=f"{trace_id:032x}",
-        agent_span_id=f"{span_id:016x}",
+        agent_trace_id=trace_id,
+        agent_span_id=span_id,
     )

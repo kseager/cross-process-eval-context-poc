@@ -1,69 +1,51 @@
 # cross-process-eval-context-poc
 
-A proof-of-concept that attaches a **ground-truth object** to an agent's trace
-**from a separate process**, **without any tracing code in the agent**.
-
-How it works: the agent runs as a **black box** and authors its own
-`invoke_agent` span natively; the agent host returns that span's
-`(trace_id, span_id)`; a separate **evaluation driver** then emits a
-`gen_ai.evaluation.context` OTel event stamped with those ids, carrying the
-ground truth. The event lands as a log record correlated to the agent's
-`invoke_agent` span (`operation_ParentId` == the agent span id) in the same
-trace.
-
-Net result: the agent's real `invoke_agent → chat` spans stay exactly as the
-framework produced them — nothing is mutated and no child span is fabricated —
-and the ground truth is added afterward as a correlated event in the same trace,
-attached across a process boundary.
+A proof-of-concept that attaches **ground-truth** to an agent's trace
+**from a separate process**, **without changing the agent code (BYO Agent)**.
 
 ## Adopt this with your own agent (BYO agent)
-
-You do **not** need to understand or touch any tracing internals
-(`invoke_agent`, `gen_ai.evaluation.context` events, span processors, telemetry
-setup). Treat the agent as a **black box**. The host invokes it and returns the
-ids; the driver emits the ground-truth event.
-
-**The only file you edit is [`src/span_two_process_eval_poc/agent.py`](src/span_two_process_eval_poc/agent.py).**
-Replace the body of `build_agent()` so it returns *your* agent. Everything else
-stays exactly as shipped.
 
 **Preconditions** (the shipped harness already meets #2 and #3):
 
 1. **Your agent emits an `invoke_agent` span.** That span is what ground truth
    attaches to. The Microsoft Agent Framework emits it automatically; other
    frameworks must emit one (or nothing correlates).
-2. **The host returns that span's `(trace_id, span_id)`** — done by the passive
-   `SpanProcessor` in `agent_service.py`.
+2. **The host returns that span's `(trace_id, span_id)`** — the shipped
+   `agent_service.py` does this with a passive `SpanProcessor`.
 3. **Both processes share one App Insights connection string** — set once in
    `.env`.
 
-### Step 1 — plug in your agent
+### Step 1 — plug in your agent — [`agent.py`](src/span_two_process_eval_poc/agent.py)
 
-`build_agent()` must return an object with an **async `run(query: str)` method**
-that returns the agent's answer (any object; it is stringified). That is the
-only contract on the agent itself.
+- **Option 1 — use the shipped Foundry agent and host.** Keep `agent.py` and
+  `agent_service.py`, then change only the model and instructions. If you
+  replace the agent implementation but keep the shipped host, `build_agent()`
+  must return an object with an async `run(messages)` method.
 
-```python
-# src/span_two_process_eval_poc/agent.py
-def build_agent():
-    # Build and return YOUR agent however you normally do.
-    # No tracing, no spans, no OpenTelemetry — just your agent.
-    return MyAgent(...)          # must expose:  async def run(self, query: str)
-```
+  ```python
+  def build_agent():
+      return MyAgent(...)  # must expose: async def run(self, messages)
+  ```
 
-If your agent already uses the Microsoft Agent Framework, you can keep the
-shipped implementation and only change the model/instructions. If it is a
-LangChain / custom / HTTP agent, wrap it in a tiny class:
+- **Option 2 — use your own instrumented agent host.** You do not need
+  `agent.py` or `agent_service.py`. Keep your host and expose the contract
+  expected by `eval_driver.py`:
 
-```python
-class MyAgentAdapter:
-    def __init__(self, my_agent):
-        self._agent = my_agent
-    async def run(self, query: str) -> str:
-        return await self._agent.ainvoke(query)   # adapt to your API
-```
+  - Accept requests at `http://localhost:8002/invoke-standalone` (or pass your
+    endpoint with `--agent-service-url`).
+  - Return `agent_trace_id` and `agent_span_id` as integers or hexadecimal
+    strings for the agent span to which ground truth should attach. The driver
+    validates them and formats them to the canonical 32- and 16-character
+    hexadecimal widths:
 
-### Step 2 — configure `.env`
+    ```json
+    {
+      "agent_trace_id": "0123456789abcdef0123456789abcdef",
+      "agent_span_id": "0123456789abcdef"
+    }
+    ```
+
+### Step 2 — configure `.env` — [`.env.example`](.env.example)
 
 ```
 cp .env.example .env
@@ -73,7 +55,7 @@ Fill in your model endpoint / deployment and your **Application Insights
 connection string** (where traces are sent). Nothing here is about tracing
 mechanics — just credentials and the destination.
 
-### Step 3 — build your dataset
+### Step 3 — build your dataset — [`data/dataset.jsonl`](data/dataset.jsonl)
 
 Put your input `messages` and `ground_truth` in `data/dataset.jsonl`, one JSON
 object per line. `messages` is the standard agent-input contract (a list of
@@ -85,7 +67,7 @@ object:
 {"id": "q2", "messages": [{"role": "user", "content": "Who wrote Romeo and Juliet?"}], "ground_truth": "William Shakespeare"}
 ```
 
-### Step 4 — run it (two processes)
+### Step 4 — run agent — [`agent_service.py`](src/span_two_process_eval_poc/agent_service.py) · [`eval_driver.py`](src/span_two_process_eval_poc/eval_driver.py)
 
 ```bash
 uv sync
@@ -93,15 +75,26 @@ uv sync
 # 1. start the agent host (wraps your build_agent())
 uv run uvicorn span_two_process_eval_poc.agent_service:app --port 8002
 
-# 2. in another terminal, run the driver over your dataset
+# 2. in another terminal, run the evaluation driver over your dataset
 uv run run-poc --dataset data/dataset.jsonl
 ```
 
-### That's it
+### Step 5 — run the evaluations (optional post-processing) — [`evaluation.py`](src/span_two_process_eval_poc/evaluation.py)
 
-The driver prints an `operation_Id` per row and a ready-to-paste KQL query. Open
-App Insights → Logs, paste it, and you'll see each trace with your ground truth
-correlated to the agent's `invoke_agent` span.
+Scoring is a **separate post-processing step**. By default the driver only
+invokes the agent and emits ground truth; pass `--evaluate` (or set
+`RUN_EVALUATION=1`) to read the traces back from App Insights by trace id and
+run the built-in evaluators (`coherence`, `response_completeness`, `similarity`)
+after all invocations complete:
+
+```bash
+# same driver, with scoring turned on
+uv run run-poc --dataset data/dataset.jsonl --evaluate
+# or: RUN_EVALUATION=1 uv run run-poc --dataset data/dataset.jsonl
+```
+
+The driver prints a per-evaluator summary (`passed`/`errored`/`total`) once the
+eval run reaches `completed`.
 
 > **What you do NOT touch:** `agent_service.py`, `eval_driver.py`, and
 > `telemetry.py` are the harness. They are shipped as-is
@@ -155,16 +148,25 @@ nice-to-have.
 3. **No agent-process code changes.** The agent runs as a black box behind
    `build_agent()` with **zero** tracing code. The only integration requirement
    is on the host: it must return the agent span's `(trace_id, span_id)`.
-4. **Attach a ground-truth object only.** Carry a structured ground-truth object
-   (not a bare string) on the event. **No scores or results** are attached here
-   — only evaluation *input*.
-5. **Cheap, unambiguous backend query.** Correlation must be resolvable in App
+4. **Cheap, unambiguous backend query.** Correlation must be resolvable in App
    Insights with a simple, first-class join (no fragile string/JSON parsing).
-6. **Attachable after the agent interaction.** Evaluation context can be added
+5. **Attachable after the agent interaction.** Evaluation context can be added
    *after* the agent has finished — same spirit as attributes, but stamped
    post-hoc from another process without touching the already-ended agent span.
 
 ## How it works
+
+The agent runs as a **black box** and authors its own `invoke_agent` span
+natively; the agent host returns that span's `(trace_id, span_id)`; a separate
+**evaluation driver** then emits a `gen_ai.evaluation.context` OTel event
+stamped with those ids, carrying the ground truth. The event lands as a log
+record correlated to the agent's `invoke_agent` span (`operation_ParentId` ==
+the agent span id) in the same trace.
+
+Net result: the agent's real `invoke_agent → chat` spans stay exactly as the
+framework produced them — nothing is mutated and no child span is fabricated —
+and the ground truth is added afterward as a correlated event in the same trace,
+attached across a process boundary.
 
 ```mermaid
 sequenceDiagram
@@ -184,7 +186,7 @@ sequenceDiagram
     Note over AS: SpanProcessor captures invoke_agent (trace_id, span_id)
     end
     AS->>AI: invoke_agent + chat spans
-    AS-->>ED: { response, agent_trace_id, agent_span_id }
+    AS-->>ED: { agent_trace_id, agent_span_id }
 
     rect rgb(219, 240, 255)
     Note over ED: build Event("gen_ai.evaluation.context",<br/>trace_id=agent_trace_id, span_id=agent_span_id)
