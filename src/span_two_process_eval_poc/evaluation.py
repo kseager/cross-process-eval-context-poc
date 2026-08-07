@@ -3,7 +3,7 @@
 Evaluates App Insights traces by ``operation_Id`` (== OTel ``trace_id``) using
 Azure AI Foundry's built-in evaluators via the OpenAI-compatible ``evals`` API.
 Two evaluators are wired: ``builtin.coherence`` (no ground truth required) and
-``builtin.similarity`` (requires ground truth surfaced as ``sample.ground_truth``
+``builtin.response_completeness`` (requires ground truth surfaced as ``sample.ground_truth``
 by the RAISvc ground-truth lift).
 """
 
@@ -23,10 +23,8 @@ logger = logging.getLogger("evaluation")
 NON_GT_EVALUATOR_NAME = "coherence"
 NON_GT_EVALUATOR_ID = "builtin.coherence"
 
-GT_EVALUATOR_NAME = "similarity"
-GT_EVALUATOR_ID = "builtin.similarity"
-
-GT_EVALUATOR_THRESHOLD = 3
+GT_EVALUATOR_NAME = "response_completeness"
+GT_EVALUATOR_ID = "builtin.response_completeness"
 
 _TERMINAL_STATES = {"completed", "failed", "canceled"}
 
@@ -73,13 +71,13 @@ def _build_evaluator_config(
     *,
     with_ground_truth: bool,
     needs_model: bool,
+    with_query: bool = True,
     threshold: int | None = None,
 ) -> dict[str, Any]:
     """Build one ``azure_ai_evaluator`` testing-criterion block."""
-    data_mapping: dict[str, str] = {
-        "query": "{{item.query}}",
-        "response": "{{item.response}}",
-    }
+    data_mapping: dict[str, str] = {"response": "{{item.response}}"}
+    if with_query:
+        data_mapping["query"] = "{{item.query}}"
     if with_ground_truth:
         data_mapping["ground_truth"] = "{{item.ground_truth}}"
 
@@ -147,7 +145,7 @@ def evaluate_traces(
             model_deployment_name,
             with_ground_truth=True,
             needs_model=True,
-            threshold=GT_EVALUATOR_THRESHOLD,
+            with_query=False,
         ),
     ]
 
@@ -273,7 +271,7 @@ def check_evaluation_results(summary: EvaluationSummary) -> bool:
     """Check the eval outcome against the POC's expectations.
 
     Expects the non-GT evaluator (``coherence``) to produce at least one passing
-    result, and the GT-requiring evaluator (``similarity``) to score at least one
+    result, and the GT-requiring evaluator (``response_completeness``) to score at least one
     trace once ground truth is surfaced as ``sample.ground_truth``.
 
     Returns:
