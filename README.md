@@ -262,9 +262,22 @@ traces
 | project timestamp, operation_Id,
           parent_invoke_agent = operation_ParentId,
           ground_truth = tostring(customDimensions["gen_ai.evaluation.ground_truth"])
-// The parent invoke_agent span (agent's own):
-//   dependencies | where name startswith "invoke_agent"
-//   | where id == <event operation_ParentId>
+```
+
+To confirm which agent span each ground-truth event is bound to, join the event
+to its `invoke_agent` span (the agent's own span lands in `dependencies`; the
+event's `operation_ParentId` equals that span's `id`):
+
+```kql
+traces
+| where customDimensions["event.name"] == "gen_ai.evaluation.context"
+| project operation_Id, agent_span_id = operation_ParentId,
+          ground_truth = tostring(customDimensions["gen_ai.evaluation.ground_truth"])
+| join kind=inner (
+    dependencies
+    | where name startswith "invoke_agent"
+    | project operation_Id, agent_span_id = id, invoke_agent_name = name
+) on operation_Id, agent_span_id
 ```
 
 To see every span from a specific run, filter by the `operation_Id`s the driver
@@ -311,8 +324,10 @@ union traces, dependencies, requests, exceptions
     (body, HTTP header, message field). Either way the requirement lands on the
     **host/runtime**, never on the agent author's logic. The `SpanProcessor` here
     is simply the in-process stand-in for "the host returns the span ids."
-- The ground-truth object is set **directly as a JSON attribute**
-  (`gen_ai.evaluation.ground_truth`) on the driver's span, which is attached as a
-  child of the agent's real `invoke_agent` span (same `trace_id`, cross-process).
-  OTel attribute values must be primitives, so the structured object travels as a
+- The ground-truth object is carried as a JSON **attribute**
+  (`gen_ai.evaluation.ground_truth`) on a `gen_ai.evaluation.context` **event**
+  that the driver stamps with the agent's `(trace_id, span_id)` — landing it in
+  the same trace as a log record correlated to the agent's `invoke_agent` span
+  via `operation_ParentId`, without mutating the already-ended agent span. OTel
+  attribute values must be primitives, so the structured object travels as a
   JSON string.
