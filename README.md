@@ -88,7 +88,7 @@ correlated to the agent's `invoke_agent` span.
 > `trace_context.py`, and `telemetry.py` are the harness. They are shipped as-is
 > and require no changes. The agent is a black box behind `build_agent()`.
 
-## The contract between Agent and eval driver
+## The contract between Agent and Evaluation Driver
 
 The agent needs no tracing code. The only requirement is on the agent **host**:
 every invocation must **return the ids of the span the agent authored**, so the
@@ -141,6 +141,9 @@ nice-to-have.
    — only evaluation *input*.
 5. **Cheap, unambiguous backend query.** Correlation must be resolvable in App
    Insights with a simple, first-class join (no fragile string/JSON parsing).
+6. **Attachable after the agent interaction.** Evaluation context can be added
+   *after* the agent has finished — same spirit as attributes, but stamped
+   post-hoc from another process without touching the already-ended agent span.
 
 ## How it works
 
@@ -204,7 +207,6 @@ data/dataset.jsonl                         # query + ground_truth rows
 src/span_two_process_eval_poc/
   dataset.py                               # JSONL loader
   telemetry.py                             # Azure Monitor setup (both processes)
-  trace_context.py                         # shared span/attribute name constants
   agent.py                                 # Foundry agent builder (no POC-specific code)
   agent_service.py                         # FastAPI /invoke-standalone — runs agent natively, returns its span ids
   eval_driver.py                           # DRIVER: calls the agent, emits gen_ai.evaluation.context event + ground truth
@@ -314,7 +316,3 @@ union traces, dependencies, requests, exceptions
   child of the agent's real `invoke_agent` span (same `trace_id`, cross-process).
   OTel attribute values must be primitives, so the structured object travels as a
   JSON string.
-- Evaluation/scoring is **not** performed here — only ground-truth *input* is
-  attached. Scoring is a separate **post-processing** step run after all agent
-  invocations complete (read the spans back from App Insights and compute
-  metrics).

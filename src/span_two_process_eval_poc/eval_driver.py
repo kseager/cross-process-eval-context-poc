@@ -24,14 +24,14 @@ from opentelemetry._events import Event, get_event_logger
 
 from .dataset import load_dataset
 from .telemetry import setup_observability
-from .trace_context import (
-    GROUND_TRUTH_ATTRIBUTE,
-)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("eval-driver")
 
 SERVICE_NAME = "eval-driver"
+
+# Cross-process contract: the attribute the eval service lifts ground truth from.
+GROUND_TRUTH_ATTRIBUTE = "gen_ai.evaluation.ground_truth"
 
 DEFAULT_DATASET = Path(__file__).resolve().parents[2] / "data" / "dataset.jsonl"
 DEFAULT_AGENT_SERVICE_URL = "http://localhost:8002/invoke-standalone"
