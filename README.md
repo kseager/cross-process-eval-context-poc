@@ -73,7 +73,17 @@ Fill in your model endpoint / deployment and your **Application Insights
 connection string** (where traces are sent). Nothing here is about tracing
 mechanics — just credentials and the destination.
 
-### Step 3 — run it (two processes)
+### Step 3 — build your dataset
+
+Put your `query` / `ground_truth` pairs in `data/dataset.jsonl`, one JSON object
+per line. `ground_truth` can be a string or a structured object:
+
+```jsonl
+{"id": "q1", "query": "What is the capital of France?", "ground_truth": "Paris"}
+{"id": "q2", "query": "Who wrote Romeo and Juliet?", "ground_truth": "William Shakespeare"}
+```
+
+### Step 4 — run it (two processes)
 
 ```bash
 uv sync
@@ -84,9 +94,6 @@ uv run uvicorn span_two_process_eval_poc.agent_service:app --port 8002
 # 2. in another terminal, run the driver over your dataset
 uv run run-poc --dataset data/dataset.jsonl
 ```
-
-Put your `query` / `ground_truth` pairs in `data/dataset.jsonl` (one JSON object
-per line; `ground_truth` can be a string or a structured object).
 
 ### That's it
 
