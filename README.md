@@ -27,6 +27,16 @@ ids; the driver emits the ground-truth event.
 Replace the body of `build_agent()` so it returns *your* agent. Everything else
 stays exactly as shipped.
 
+**Preconditions** (the shipped harness already meets #2 and #3):
+
+1. **Your agent emits an `invoke_agent` span.** That span is what ground truth
+   attaches to. The Microsoft Agent Framework emits it automatically; other
+   frameworks must emit one (or nothing correlates).
+2. **The host returns that span's `(trace_id, span_id)`** — done by the passive
+   `SpanProcessor` in `agent_service.py`.
+3. **Both processes share one App Insights connection string** — set once in
+   `.env`.
+
 ### Step 1 — plug in your agent
 
 `build_agent()` must return an object with an **async `run(query: str)` method**
@@ -84,8 +94,8 @@ The driver prints an `operation_Id` per row and a ready-to-paste KQL query. Open
 App Insights → Logs, paste it, and you'll see each trace with your ground truth
 correlated to the agent's `invoke_agent` span.
 
-> **What you do NOT touch:** `agent_service.py`, `eval_driver.py`,
-> `trace_context.py`, and `telemetry.py` are the harness. They are shipped as-is
+> **What you do NOT touch:** `agent_service.py`, `eval_driver.py`, and
+> `telemetry.py` are the harness. They are shipped as-is
 > and require no changes. The agent is a black box behind `build_agent()`.
 
 ## The contract between Agent and Evaluation Driver
