@@ -1,8 +1,8 @@
 """Driver that attaches evaluation ground truth to an agent's own trace.
 
-The agent runs first as a black box with no incoming ``traceparent``. It authors
+The agent runs first as a black box. It authors
 its own ``invoke_agent`` span and returns that span's ``(trace_id, span_id)``.
-The driver then emits a ``gen_ai.evaluation.result`` event stamped with those
+The driver then emits a ``gen_ai.evaluation.context`` event stamped with those
 ids, correlating ground truth to the agent's span in the same trace
 (``operation_ParentId`` == the agent's span) without mutating it. Optionally,
 ``--evaluate`` runs a trace-id evaluation post-processing step over the run.
@@ -43,7 +43,7 @@ async def run(dataset_path: Path, agent_service_url: str) -> list[dict[str, str]
     """Drive the evaluation loop.
 
     For each row: invoke the agent as a black box, receive the span ids it
-    authored, then emit a ``gen_ai.evaluation.result`` OTel event stamped with
+    authored, then emit a ``gen_ai.evaluation.context`` OTel event stamped with
     that span's ``(trace_id, span_id)``, carrying ground truth. The event is a
     log record correlated to the agent's ``invoke_agent`` span
     (``operation_ParentId`` == the agent span id) in the same trace -- no child
@@ -61,7 +61,7 @@ async def run(dataset_path: Path, agent_service_url: str) -> list[dict[str, str]
             print(f"\n[{item.id}]")
             print(f"  query          : {item.query}")
 
-            # Invoke the agent as a black box -- no traceparent, no context.
+            # Invoke the agent as a black box.
             try:
                 resp = await client.post(
                     agent_service_url,
@@ -84,7 +84,7 @@ async def run(dataset_path: Path, agent_service_url: str) -> list[dict[str, str]
             print(f"  response       : {response_text}")
             print(f"  ground_truth   : {item.ground_truth}")
 
-            # Emit a gen_ai.evaluation.result event stamped with the agent's
+            # Emit a gen_ai.evaluation.context event stamped with the agent's
             # (trace_id, span_id): a log record correlated to the agent's own
             # invoke_agent span (operation_ParentId == agent span id) in the
             # same trace, without mutating the already-ended span.
@@ -92,7 +92,7 @@ async def run(dataset_path: Path, agent_service_url: str) -> list[dict[str, str]
 
             ground_truth_json = json.dumps(item.ground_truth, ensure_ascii=False)
             evaluation_event = Event(
-                name="gen_ai.evaluation.result",
+                name="gen_ai.evaluation.context",
                 attributes={
                     "gen_ai.evaluation.item_id": item.id,
                     GROUND_TRUTH_ATTRIBUTE: ground_truth_json,
@@ -104,7 +104,7 @@ async def run(dataset_path: Path, agent_service_url: str) -> list[dict[str, str]
             event_logger.emit(evaluation_event)
 
             print(
-                f"  eval_event     : name=gen_ai.evaluation.result "
+                f"  eval_event     : name=gen_ai.evaluation.context "
                 f"trace_id={operation_id} "
                 f"(parent=agent span {agent_span_id})"
             )
@@ -160,7 +160,7 @@ def cli() -> None:
     results = asyncio.run(run(args.dataset, args.agent_service_url))
 
     print(
-        "\nDone. Agent authored its own span; a gen_ai.evaluation.result event "
+        "\nDone. Agent authored its own span; a gen_ai.evaluation.context event "
         "(with ground_truth) was EMITTED stamped with that span's ids, in the "
         "same trace (operation_ParentId == the agent span)."
     )

@@ -3,22 +3,25 @@
 A proof-of-concept that attaches a **ground-truth object** to an agent's trace
 **from a separate process**, **without any tracing code in the agent**.
 
-How it works, in one line: the agent runs as a **black box** and authors its own
+How it works: the agent runs as a **black box** and authors its own
 `invoke_agent` span natively; the agent host returns that span's
-`(trace_id, span_id)`; a separate **evaluation driver** then opens an
-`evaluation_context` span as a **child** of that span (same trace) and stamps the
-ground truth on it.
+`(trace_id, span_id)`; a separate **evaluation driver** then emits a
+`gen_ai.evaluation.context` OTel event stamped with those ids, carrying the
+ground truth. The event lands as a log record correlated to the agent's
+`invoke_agent` span (`operation_ParentId` == the agent span id) in the same
+trace.
 
 Net result: the agent's real `invoke_agent → chat` spans stay exactly as the
-framework produced them, and the ground truth is added afterward as a child
-annotation in the same trace — attached across a process boundary.
+framework produced them — nothing is mutated and no child span is fabricated —
+and the ground truth is added afterward as a correlated event in the same trace,
+attached across a process boundary.
 
 ## Adopt this with your own agent (BYO agent)
 
 You do **not** need to understand or touch any tracing internals
-(`invoke_agent`, `evaluation_context`, `traceparent`, span processors, telemetry
+(`invoke_agent`, `gen_ai.evaluation.context` events, span processors, telemetry
 setup). Treat the agent as a **black box**. The host invokes it and returns the
-ids; the driver attaches the ground truth.
+ids; the driver emits the ground-truth event.
 
 **The only file you edit is [`src/span_two_process_eval_poc/agent.py`](src/span_two_process_eval_poc/agent.py).**
 Replace the body of `build_agent()` so it returns *your* agent. Everything else
@@ -79,18 +82,17 @@ per line; `ground_truth` can be a string or a structured object).
 
 The driver prints an `operation_Id` per row and a ready-to-paste KQL query. Open
 App Insights → Logs, paste it, and you'll see each trace with your ground truth
-attached as a child of the agent's `invoke_agent` span. **You never wrote a line
-of telemetry code.**
+correlated to the agent's `invoke_agent` span.
 
 > **What you do NOT touch:** `agent_service.py`, `eval_driver.py`,
 > `trace_context.py`, and `telemetry.py` are the harness. They are shipped as-is
 > and require no changes. The agent is a black box behind `build_agent()`.
 
-## The contract (the one thing that matters)
+## The contract between Agent and eval driver
 
 The agent needs no tracing code. The only requirement is on the agent **host**:
 every invocation must **return the ids of the span the agent authored**, so the
-driver knows what to attach to.
+driver knows what to correlate the ground truth to.
 
 | Field | Meaning |
 |---|---|
@@ -102,7 +104,7 @@ In this POC the host (`agent_service.py`) obtains those ids with a passive
 them from `/invoke-standalone`. Any host that returns these two ids for an
 invocation can plug into the evaluation driver; how it obtains them is its own
 concern. **It does not matter who calls the agent** — any process that receives
-these ids can attach the ground-truth span afterward.
+these ids can emit the ground-truth event afterward.
 
 ## Why this design
 
@@ -110,14 +112,15 @@ these ids can attach the ground-truth span afterward.
 |---|---|
 | Processes | **Two** (agent-service + evaluation driver) |
 | Agent location | **Remote HTTP service** |
-| Ground truth attached to | An `evaluation_context` span, child of the agent's `invoke_agent` span (JSON **attribute**) |
-| Agent code changes | **None** — the agent runs natively; the host returns the span ids; the driver attaches afterward |
+| Ground truth carried by | A `gen_ai.evaluation.context` event correlated to the agent's `invoke_agent` span (JSON **attribute**) |
+| Agent code changes | **None** — the agent runs natively; the host returns the span ids; the driver emits the event afterward |
 
 The agent authors its own `invoke_agent` span natively (with `chat`/tool spans
-beneath it). The driver attaches an `evaluation_context` span as a child of that
-span in the **same trace**, so the whole invocation — agent work plus ground
-truth — lives in one coherent subtree, without the agent knowing anything about
-evaluation.
+beneath it). The driver emits a `gen_ai.evaluation.context` event stamped with
+that span's `(trace_id, span_id)`, so it lands as a log record correlated to the
+agent's `invoke_agent` span in the **same trace** — the whole invocation (agent
+work plus ground truth) lives in one coherent trace, without the agent knowing
+anything about evaluation and without mutating any span.
 
 ## Requirements
 
@@ -125,16 +128,17 @@ The design must satisfy all of the following. Each is a hard requirement, not a
 nice-to-have.
 
 1. **Ground truth correlated to the exact agent span.** The ground-truth object
-   must attach to **the** `invoke_agent` span for the row, identified by its
-   `span_id`, as a child in the same trace.
+   must correlate to **the** `invoke_agent` span for the row, identified by its
+   `span_id`, as an event in the same trace (`operation_ParentId` == that
+   `span_id`).
 2. **Separate agent process.** The agent runs as a **separate HTTP service**
    from the driver that attaches the ground truth (both alive concurrently).
 3. **No agent-process code changes.** The agent runs as a black box behind
    `build_agent()` with **zero** tracing code. The only integration requirement
    is on the host: it must return the agent span's `(trace_id, span_id)`.
 4. **Attach a ground-truth object only.** Carry a structured ground-truth object
-   (not a bare string). **No scores or results** are attached here — only
-   evaluation *input*.
+   (not a bare string) on the event. **No scores or results** are attached here
+   — only evaluation *input*.
 5. **Cheap, unambiguous backend query.** Correlation must be resolvable in App
    Insights with a simple, first-class join (no fragile string/JSON parsing).
 
@@ -149,7 +153,7 @@ sequenceDiagram
 
     Note over ED: rows = [id -> DatasetItem]<br/>(ground-truth registry)
 
-    ED->>AS: POST /invoke-standalone { item_id, query }<br/>(no traceparent)
+    ED->>AS: POST /invoke-standalone { item_id, query }
 
     rect rgb(255, 249, 219)
     Note over AS: run agent natively (black box)
@@ -161,29 +165,30 @@ sequenceDiagram
     AS-->>ED: { response, agent_trace_id, agent_span_id }
 
     rect rgb(219, 240, 255)
-    Note over ED: build_traceparent(agent ids) -> remote parent context
-    Note over ED: with start_as_current_span("evaluation_context", parent) as span
-    ED->>ED: span.set_attribute("gen_ai.evaluation.ground_truth", json(gt))
-    ED->>ED: assert evaluation_context trace_id == agent_trace_id
+    Note over ED: build Event("gen_ai.evaluation.context",<br/>trace_id=agent_trace_id, span_id=agent_span_id)
+    ED->>ED: event.attributes["gen_ai.evaluation.ground_truth"] = json(gt)
+    ED->>ED: assert event trace_id == agent_trace_id
     end
-    ED->>AI: evaluation_context span + ground_truth attribute
+    ED->>AI: gen_ai.evaluation.context event<br/>(log record, operation_ParentId = agent span)
 
     Note over AI: post-processing step (optional --evaluate):<br/>read spans back by trace id, score vs ground truth
 ```
 
-Resulting span tree (one `trace_id`):
+Resulting spans + event (one `trace_id`):
 
 ```
 invoke_agent <name>                  (agent-service, framework's own span, span_id=A)
 │  └─ chat / tool spans              (agent framework)
-└─ evaluation_context                (driver, attached via returned ids; parent=A)
+└─ gen_ai.evaluation.context          (driver, log record; operation_ParentId=A)
       • attribute: gen_ai.evaluation.ground_truth = {...}   ← ground truth here
 ```
 
 The **agent process is never involved in correlation** — the agent runs
 natively and Agent Framework emits its own `invoke_agent → chat` spans. The host
 captures the `invoke_agent` span's `(trace_id, span_id)` with a passive
-truth on it. No span is fabricated above the agent's own root.
+`SpanProcessor` and returns them; the driver then emits an event stamped with
+those ids, carrying the ground truth. No span is mutated and none is fabricated
+above the agent's own root.
 
 > **Evaluation is a separate post-processing step.** By default the driver only
 > *attaches ground-truth input* to the agent's trace. Scoring the responses
@@ -199,10 +204,10 @@ data/dataset.jsonl                         # query + ground_truth rows
 src/span_two_process_eval_poc/
   dataset.py                               # JSONL loader
   telemetry.py                             # Azure Monitor setup (both processes)
-  trace_context.py                         # build/parse traceparent (the core)
+  trace_context.py                         # shared span/attribute name constants
   agent.py                                 # Foundry agent builder (no POC-specific code)
   agent_service.py                         # FastAPI /invoke-standalone — runs agent natively, returns its span ids
-  eval_driver.py                           # DRIVER: calls the agent, attaches evaluation_context + ground truth
+  eval_driver.py                           # DRIVER: calls the agent, emits gen_ai.evaluation.context event + ground truth
   evaluation.py                            # optional --evaluate post-processing (trace-id scoring)
 ```
 
@@ -239,26 +244,25 @@ uv run run-poc
 ```
 
 The driver prints, per row, the agent's `invoke_agent` `trace_id`/`span_id`
-(= `operation_Id`), confirms the attached `evaluation_context` span is in the
-**same trace**, and at the end prints an `operation_Id` summary plus a
-ready-to-paste App Insights KQL query.
+(= `operation_Id`), confirms the emitted `gen_ai.evaluation.context` event is
+stamped into the **same trace**, and at the end prints an `operation_Id` summary
+plus a ready-to-paste App Insights KQL query.
 
 ## Verify in App Insights (KQL)
 
-The ground truth is a JSON **attribute on the `evaluation_context` span**, which
-is attached as a child of the agent's `invoke_agent` span via
-`operation_ParentId` (same `operation_Id`):
+The ground truth is a JSON **attribute on the `gen_ai.evaluation.context`
+event**, which lands in the `traces` table as a log record correlated to the
+agent's `invoke_agent` span via `operation_ParentId` (same `operation_Id`):
 
 ```kql
-dependencies
-| where name == "evaluation_context"
+traces
+| where customDimensions["event.name"] == "gen_ai.evaluation.context"
 | project timestamp, operation_Id,
-          evaluation_context_span = id,
           parent_invoke_agent = operation_ParentId,
           ground_truth = tostring(customDimensions["gen_ai.evaluation.ground_truth"])
 // The parent invoke_agent span (agent's own):
 //   dependencies | where name startswith "invoke_agent"
-//   | where id == <evaluation_context operation_ParentId>
+//   | where id == <event operation_ParentId>
 ```
 
 To see every span from a specific run, filter by the `operation_Id`s the driver
@@ -280,10 +284,10 @@ union traces, dependencies, requests, exceptions
   needs **zero** tracing code. The *only* contract between the agent and the
   harness is that the invocation **returns the agent's `trace_id` + `span_id`**.
   Any process — this driver, a notebook, a CI job, some other service — that
-  receives those two ids can attach the ground-truth span afterward. There is no
+  receives those two ids can emit the ground-truth event afterward. There is no
   requirement that the evaluation harness be the caller, and no context has to be
   set up *before* the agent runs; the ids flow **outward** from the agent and
-  attachment happens **after the fact**.
+  the event is emitted **after the fact**.
 - **The agent code is not changed — the _host_ surfaces the ids.** This is the
   distinction that matters. The agent (`build_agent()`) is invoked as a plain
   black box (`await _agent.run(query)`): no tracing calls, no returning ids,
