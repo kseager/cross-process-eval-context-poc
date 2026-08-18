@@ -15,6 +15,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from pathlib import Path
 
 import httpx
@@ -23,7 +24,7 @@ from opentelemetry import trace
 from opentelemetry._events import Event, get_event_logger
 
 from .dataset import load_dataset
-from .telemetry import setup_observability
+from .telemetry import flush_observability, setup_observability
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("eval-driver")
@@ -188,9 +189,19 @@ def cli() -> None:
             "the run's traces. Off by default; also enabled via RUN_EVALUATION=1."
         ),
     )
+    parser.add_argument(
+        "--ingestion-wait-seconds",
+        type=int,
+        default=int(os.environ.get("EVALUATION_INGESTION_WAIT_SECONDS", "15")),
+        help=(
+            "Seconds to wait after flushing telemetry before trace evaluation. "
+            "Defaults to 15."
+        ),
+    )
     args = parser.parse_args()
 
     results = asyncio.run(run(args.dataset, args.agent_service_url))
+    flush_observability()
 
     print(
         "\nDone. Agent authored its own span; a gen_ai.evaluation.context event "
@@ -229,6 +240,13 @@ def cli() -> None:
         return
 
     from .evaluation import check_evaluation_results, evaluate_traces
+
+    if args.ingestion_wait_seconds > 0:
+        print(
+            f"\nTelemetry flushed. Waiting {args.ingestion_wait_seconds}s for "
+            "Application Insights ingestion..."
+        )
+        time.sleep(args.ingestion_wait_seconds)
 
     print(f"\n=== Running trace-id evaluation over {len(op_ids)} trace(s) ===")
     summary = evaluate_traces(op_ids)

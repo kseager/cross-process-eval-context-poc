@@ -13,6 +13,7 @@ calling it, so ``create_resource`` tags their spans with distinct
 
 from __future__ import annotations
 
+import logging
 import os
 
 from azure.monitor.opentelemetry import configure_azure_monitor
@@ -39,6 +40,14 @@ def setup_observability() -> None:
             "Copy .env.example to .env and fill it in."
         )
 
+    # The root logger is intentionally INFO for POC progress, but Azure SDK
+    # transport logs otherwise bury the demo output with exporter requests.
+    logging.getLogger("azure").setLevel(logging.WARNING)
+    logging.getLogger("azure.ai.projects.telemetry._ai_project_instrumentor").setLevel(
+        logging.ERROR
+    )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+
     from agent_framework.observability import create_resource, enable_sensitive_telemetry
 
     configure_azure_monitor(
@@ -56,3 +65,13 @@ def setup_observability() -> None:
 
     if _truthy(os.environ.get("ENABLE_SENSITIVE_DATA")):
         enable_sensitive_telemetry()
+
+
+def flush_observability(timeout_millis: int = 30_000) -> None:
+    """Flush buffered log events before starting trace-based evaluation."""
+    from opentelemetry._logs import get_logger_provider
+
+    provider = get_logger_provider()
+    force_flush = getattr(provider, "force_flush", None)
+    if force_flush is not None and not force_flush(timeout_millis):
+        raise RuntimeError("Timed out flushing telemetry to Application Insights.")

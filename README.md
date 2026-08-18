@@ -93,6 +93,10 @@ uv run run-poc --dataset data/dataset.jsonl --evaluate
 # or: RUN_EVALUATION=1 uv run run-poc --dataset data/dataset.jsonl
 ```
 
+Before starting evaluation, the driver flushes buffered ground-truth events and
+waits 15 seconds for Application Insights ingestion. Override the wait with
+`--ingestion-wait-seconds` or `EVALUATION_INGESTION_WAIT_SECONDS`.
+
 The driver prints a per-evaluator summary (`passed`/`errored`/`total`) once the
 eval run reaches `completed`.
 

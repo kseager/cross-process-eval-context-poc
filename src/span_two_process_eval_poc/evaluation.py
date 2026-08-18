@@ -65,6 +65,7 @@ class EvaluationSummary:
     criteria: dict[str, CriterionOutcome]
     total_items: int = 0
     run_error: str | None = None
+    report_url: str | None = None
 
     @property
     def infra_failed(self) -> bool:
@@ -226,6 +227,7 @@ def evaluate_traces(
             criteria=criteria,
             total_items=total_items,
             run_error=str(run_error) if run_error else None,
+            report_url=_get(run, "report_url"),
         )
 
 
@@ -297,26 +299,23 @@ def check_evaluation_results(summary: EvaluationSummary) -> bool:
     non_gt = summary.criteria.get(NON_GT_EVALUATOR_NAME)
     gt = summary.criteria.get(GT_EVALUATOR_NAME)
 
-    print("\n=== Evaluation results ===")
-    print(f"eval_id : {summary.eval_id}")
-    print(f"run_id  : {summary.run_id}")
-    print(f"status  : {summary.status}")
-    print(f"items   : {summary.total_items}")
+    print("\n=== Demo summary ===")
+    print(
+        f"Captured : {summary.total_items} agent traces + "
+        f"{summary.total_items} correlated ground-truth events"
+    )
+    print(f"Evaluation: {summary.status} ({summary.total_items} trace items)")
+    print("Results:")
     for name, c in summary.criteria.items():
-        print(
-            f"  {name:<12} passed={c.passed} errored={c.errored} total={c.total}"
-        )
+        print(f"  {name:<22} {c.passed}/{c.total} passed")
+    print(f"Run      : {summary.run_id}")
+    if summary.report_url:
+        print(f"View     : {summary.report_url}")
 
     if summary.infra_failed:
-        print("\n--- Run did NOT produce results (infrastructure failure) ---")
+        print("\nOutcome  : INCONCLUSIVE (evaluation infrastructure failure)")
         if summary.run_error:
-            print(f"  run error: {summary.run_error[:500]}")
-        print(
-            "\n[INCONCLUSIVE] The eval service failed before scoring any trace "
-            "(0 output items), so the ground-truth flow could not be tested. "
-            "This is a backend/resource problem, not a POC bug -- re-run "
-            "against a healthy Foundry project."
-        )
+            print(f"Error    : {summary.run_error[:500]}")
         return False
 
     non_gt_ok = non_gt is not None and non_gt.any_passed
@@ -324,27 +323,14 @@ def check_evaluation_results(summary: EvaluationSummary) -> bool:
         gt is not None and gt.total > 0 and gt.any_passed and not gt.all_errored
     )
 
-    print("\n--- Expectation check ---")
-    print(
-        f"  non-GT '{NON_GT_EVALUATOR_NAME}' produced a passing score : "
-        f"{'YES (expected)' if non_gt_ok else 'NO (UNEXPECTED)'}"
-    )
-    print(
-        f"  GT '{GT_EVALUATOR_NAME}' scored (ground_truth surfaced) : "
-        f"{'YES (expected)' if gt_scored else 'NO (UNEXPECTED)'}"
-    )
-
     meets_expectations = non_gt_ok and gt_scored
     if meets_expectations:
         print(
-            "\n[OK] E2E matches expectations: coherence scored the trace, and the "
-            "ground-truth evaluator scored because the RAISvc lift surfaced "
-            "gen_ai.evaluation.ground_truth as sample.ground_truth."
+            "Outcome  : PASS - trace ground truth was lifted and evaluated "
+            "successfully."
         )
     else:
         print(
-            "\n[FAIL] E2E did NOT match expectations -- inspect the eval run output "
-            "items above. (Either coherence did not score, or the GT evaluator "
-            "did not score -- check that ground_truth reached the evaluator.)"
+            "Outcome  : FAIL - coherence or ground-truth evaluation did not score."
         )
     return meets_expectations
