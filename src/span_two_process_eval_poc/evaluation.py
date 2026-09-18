@@ -15,10 +15,13 @@ import logging
 import os
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from azure.ai.projects import AIProjectClient
 from azure.identity import DefaultAzureCredential
+from dotenv import set_key
+from openai import NotFoundError
 
 logger = logging.getLogger("evaluation")
 
@@ -35,6 +38,8 @@ SIMILARITY_EVALUATOR_NAME = "similarity"
 SIMILARITY_EVALUATOR_ID = "builtin.similarity"
 
 _TERMINAL_STATES = {"completed", "failed", "canceled"}
+_ENV_FILE = Path(__file__).resolve().parents[2] / ".env"
+_EVAL_GROUP_ID_ENV_VAR = "FOUNDRY_EVAL_GROUP_ID"
 
 
 @dataclass
@@ -104,6 +109,57 @@ def _build_evaluator_config(
     return config
 
 
+def _get_or_create_eval_group(
+    client: Any, testing_criteria: list[dict[str, Any]]
+) -> Any:
+    """Reuse the configured evaluation group, creating and persisting it if needed."""
+    eval_group_id = os.environ.get(_EVAL_GROUP_ID_ENV_VAR)
+
+    if eval_group_id:
+        try:
+            eval_object = client.evals.retrieve(eval_group_id)
+            logger.info("reusing evaluation group (id=%s)", eval_group_id)
+            return eval_object
+        except NotFoundError:
+            logger.info(
+                "configured evaluation group no longer exists (id=%s); "
+                "creating a new one",
+                eval_group_id,
+            )
+    else:
+        logger.info(
+            "%s is not configured; creating a new evaluation group",
+            _EVAL_GROUP_ID_ENV_VAR,
+        )
+
+    eval_object = client.evals.create(
+        name="span_two_process_trace_eval",
+        data_source_config={
+            "type": "custom",
+            "include_sample_schema": False,
+            "item_schema": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "response": {"type": "string"},
+                    "context": {"type": "string"},
+                    "ground_truth": {"type": "string"},
+                },
+                "required": ["query", "response", "ground_truth"],
+            },
+        },
+        testing_criteria=testing_criteria,
+    )
+    os.environ[_EVAL_GROUP_ID_ENV_VAR] = eval_object.id
+    set_key(str(_ENV_FILE), _EVAL_GROUP_ID_ENV_VAR, eval_object.id, quote_mode="never")
+    logger.info(
+        "evaluation group created and saved to %s (id=%s)",
+        _ENV_FILE,
+        eval_object.id,
+    )
+    return eval_object
+
+
 def evaluate_traces(
     trace_ids: list[str],
     *,
@@ -171,25 +227,7 @@ def evaluate_traces(
         AIProjectClient(endpoint=endpoint, credential=credential) as project_client,
         project_client.get_openai_client() as client,
     ):
-        eval_object = client.evals.create(
-            name="span_two_process_trace_eval",
-            data_source_config={
-                "type": "custom",
-                "include_sample_schema": False,
-                "item_schema": {
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string"},
-                        "response": {"type": "string"},
-                        "context": {"type": "string"},
-                        "ground_truth": {"type": "string"},
-                    },
-                    "required": ["query", "response", "ground_truth"],
-                },
-            },
-            testing_criteria=testing_criteria,  # type: ignore[arg-type]
-        )
-        logger.info("evaluation created (id=%s)", eval_object.id)
+        eval_object = _get_or_create_eval_group(client, testing_criteria)
 
         data_source = {
             "type": "azure_ai_trace_data_source_preview",
